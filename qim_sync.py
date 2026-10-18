@@ -1,26 +1,56 @@
 """QIM/base-4 in-band synchronization transport.
 
-1. Sync metadata -> bytes + CRC16
-2. Byte -> 4 base-4 digits
-3. Each digit -> QIM residue
-4. repetition > 1 means one logical digit is encoded into several samples
+Protocol used by this file:
+
+* fixed balanced QIM preamble (32 logical base-4 digits);
+* payload bytes are converted to base-4 (2 bits per logical digit);
+* repetition is INTERLEAVED: the complete payload is written R times instead
+  of writing one logical digit R adjacent times;
+* CRC32 protects the packet;
+* RX does soft/list decoding: it keeps distances to all four QIM residues and
+  searches several likely payload variants instead of requiring every logical
+  digit to be hard-decoded correctly on the first try;
+* packet type is constrained to A0 (PERIODIC) or A1 (FULL);
+* a recovered packet is accepted only when its CRC32 is valid.
+
+Both peers must use this same file because CRC width, preamble and repetition
+layout are part of the wire format.
 """
 
 from __future__ import annotations
 
 import binascii
+import heapq
+from dataclasses import dataclass
+
 import numpy as np
 
 from audio_sync import AudioData
 from sync import SyncInfo
 
 
+@dataclass
+class _SoftHypothesis:
+    shift: int
+    header: int
+    packet_bytes: int
+    header_cost: int
+    raw_header: int | None
+
+
 class QIMSyncCodec:
     FULL_HEADER = 0xA1
     PERIODIC_HEADER = 0xA0
 
+    # 32 logical digits, balanced:
+    # each value 0/1/2/3 occurs exactly 8 times.
     PREAMBLE_DIGITS = np.array(
-        [0, 3, 1, 2, 3, 0, 2, 1, 1, 3, 2, 0, 3, 1, 0, 2],
+        [
+            0, 3, 1, 2, 3, 0, 2, 1,
+            1, 3, 2, 0, 3, 1, 0, 2,
+            2, 0, 3, 1, 0, 2, 1, 3,
+            3, 1, 0, 2, 1, 3, 2, 0,
+        ],
         dtype=np.int8,
     )
 
@@ -30,15 +60,25 @@ class QIMSyncCodec:
         base: int = 64,
         repetition: int = 1,
         detection_threshold: float = 0.80,
+        quantum: int | None = None,
     ):
+        # Current app.py uses base=...
+        # quantum=... is accepted too for compatibility.
+        if quantum is not None:
+            base = quantum
+
         if sample_rate <= 0:
             raise ValueError("sample_rate must be > 0")
 
         if base <= 0 or base % 4 != 0:
-            raise ValueError("QIM base must be > 0 and divisible by 4")
+            raise ValueError(
+                "QIM base/quantum must be > 0 and divisible by 4"
+            )
 
         if repetition <= 0:
-            raise ValueError("QIM repetition must be >= 1")
+            raise ValueError(
+                "QIM repetition must be >= 1"
+            )
 
         if not (0.0 < detection_threshold <= 1.0):
             raise ValueError(
@@ -46,49 +86,74 @@ class QIMSyncCodec:
             )
 
         self.sample_rate = int(sample_rate)
+
         self.base = int(base)
+        self.quantum = self.base
+
         self.step = self.base // 4
+
         self.repetition = int(repetition)
-        self.detection_threshold = float(detection_threshold)
+
+        self.detection_threshold = float(
+            detection_threshold
+        )
 
         self._centers = (
-            np.arange(4, dtype=np.int64)
+            np.arange(
+                4,
+                dtype=np.int64,
+            )
             * self.step
         )
 
-        # residue -> distance to 0/1/2/3 QIM centers
         residue_values = np.arange(
             self.base,
             dtype=np.int64,
-        ).reshape(-1, 1)
+        ).reshape(
+            -1,
+            1,
+        )
 
         direct = np.abs(
             residue_values
-            - self._centers.reshape(1, -1)
+            - self._centers.reshape(
+                1,
+                -1,
+            )
         )
 
         self._distance_lut = np.minimum(
             direct,
             self.base - direct,
-        ).astype(np.int16)
+        ).astype(
+            np.int16
+        )
 
+        # Preamble still uses local repetition so detector can
+        # aggregate R observations of every preamble digit.
+        #
+        # PAYLOAD repetition is different:
+        # whole copies of payload are transmitted.
         self._preamble_symbols = np.repeat(
             self.PREAMBLE_DIGITS,
             self.repetition,
-        ).astype(np.int8)
+        ).astype(
+            np.int8
+        )
 
     @staticmethod
-    def _crc16(data: bytes) -> int:
-        return binascii.crc_hqx(
-            data,
-            0xFFFF,
+    def _crc32(
+        data: bytes,
+    ) -> int:
+        return (
+            binascii.crc32(data)
+            & 0xFFFFFFFF
         )
 
     @staticmethod
     def _nonce_to_bytes(
         nonce: str,
     ) -> bytes:
-
         try:
             raw = bytes.fromhex(
                 nonce
@@ -111,7 +176,6 @@ class QIMSyncCodec:
         self,
         info: SyncInfo,
     ) -> bytes:
-
         if (
             info.next_frame_index < 0
             or info.next_frame_index >= 2**32
@@ -129,7 +193,8 @@ class QIMSyncCodec:
         )
 
         body.append(
-            info.sequence & 0xFF
+            info.sequence
+            & 0xFF
         )
 
         body.extend(
@@ -152,13 +217,13 @@ class QIMSyncCodec:
                 )
             )
 
-        crc = self._crc16(
+        crc = self._crc32(
             bytes(body)
         )
 
         body.extend(
             crc.to_bytes(
-                2,
+                4,
                 "big",
             )
         )
@@ -169,24 +234,29 @@ class QIMSyncCodec:
         self,
         packet: bytes,
     ) -> SyncInfo:
-
-        if len(packet) < self.periodic_packet_bytes:
+        if (
+            len(packet)
+            < self.periodic_packet_bytes
+        ):
             raise ValueError(
                 "QIM sync packet is too short"
             )
 
-        data = packet[:-2]
+        data = packet[:-4]
 
         expected_crc = int.from_bytes(
-            packet[-2:],
+            packet[-4:],
             "big",
         )
 
-        actual_crc = self._crc16(
+        actual_crc = self._crc32(
             data
         )
 
-        if actual_crc != expected_crc:
+        if (
+            actual_crc
+            != expected_crc
+        ):
             raise ValueError(
                 "QIM sync CRC mismatch"
             )
@@ -199,8 +269,14 @@ class QIMSyncCodec:
             "big",
         )
 
-        if header == self.PERIODIC_HEADER:
-            if len(packet) != self.periodic_packet_bytes:
+        if (
+            header
+            == self.PERIODIC_HEADER
+        ):
+            if (
+                len(packet)
+                != self.periodic_packet_bytes
+            ):
                 raise ValueError(
                     "invalid periodic QIM sync length"
                 )
@@ -211,8 +287,14 @@ class QIMSyncCodec:
                 session_nonce=None,
             )
 
-        if header == self.FULL_HEADER:
-            if len(packet) != self.full_packet_bytes:
+        if (
+            header
+            == self.FULL_HEADER
+        ):
+            if (
+                len(packet)
+                != self.full_packet_bytes
+            ):
                 raise ValueError(
                     "invalid full QIM sync length"
                 )
@@ -231,18 +313,32 @@ class QIMSyncCodec:
     def periodic_packet_bytes(
         self,
     ) -> int:
-        return 1 + 1 + 4 + 2
+        # header
+        # sequence
+        # uint32 frame
+        # CRC32
+        return (
+            1
+            + 1
+            + 4
+            + 4
+        )
 
     @property
     def full_packet_bytes(
         self,
     ) -> int:
+        # header
+        # sequence
+        # uint32 frame
+        # nonce 16
+        # CRC32
         return (
             1
             + 1
             + 4
             + 16
-            + 2
+            + 4
         )
 
     @property
@@ -257,7 +353,6 @@ class QIMSyncCodec:
         self,
         info: SyncInfo,
     ) -> int:
-
         packet_bytes = (
             self.full_packet_bytes
             if info.is_full
@@ -275,7 +370,6 @@ class QIMSyncCodec:
     def _bytes_to_base4(
         packet: bytes,
     ) -> np.ndarray:
-
         digits = np.empty(
             len(packet) * 4,
             dtype=np.int8,
@@ -308,7 +402,6 @@ class QIMSyncCodec:
     def _base4_to_bytes(
         digits: np.ndarray,
     ) -> bytes:
-
         digits = np.asarray(
             digits,
             dtype=np.int64,
@@ -316,7 +409,8 @@ class QIMSyncCodec:
 
         if digits.size % 4:
             raise ValueError(
-                "base-4 digit count must be divisible by 4"
+                "base-4 digit count "
+                "must be divisible by 4"
             )
 
         if np.any(
@@ -338,7 +432,8 @@ class QIMSyncCodec:
                 int(v)
                 for v
                 in digits[
-                    pos:pos + 4
+                    pos:
+                    pos + 4
                 ]
             )
 
@@ -355,7 +450,6 @@ class QIMSyncCodec:
         self,
         info: SyncInfo,
     ) -> np.ndarray:
-
         packet = self._pack(
             info
         )
@@ -366,7 +460,21 @@ class QIMSyncCodec:
             )
         )
 
-        payload_symbols = np.repeat(
+        # OLD R=4:
+        #
+        # d0 d0 d0 d0
+        # d1 d1 d1 d1
+        # d2 d2 d2 d2
+        #
+        # NEW R=4:
+        #
+        # full payload copy #1
+        # full payload copy #2
+        # full payload copy #3
+        # full payload copy #4
+        #
+        # Same logical symbol is now separated in time.
+        payload_symbols = np.tile(
             payload_digits,
             self.repetition,
         ).astype(
@@ -385,7 +493,6 @@ class QIMSyncCodec:
         carrier: np.ndarray,
         symbols: np.ndarray,
     ) -> np.ndarray:
-
         carrier = np.asarray(
             carrier,
             dtype=np.float64,
@@ -396,9 +503,13 @@ class QIMSyncCodec:
             dtype=np.int64,
         ).reshape(-1)
 
-        if carrier.size != symbols.size:
+        if (
+            carrier.size
+            != symbols.size
+        ):
             raise ValueError(
-                "carrier and QIM symbol lengths must match"
+                "carrier and QIM symbol "
+                "lengths must match"
             )
 
         if np.any(
@@ -412,6 +523,7 @@ class QIMSyncCodec:
         if carrier.size == 0:
             return carrier.copy()
 
+        # Match app.py TX int16 conversion.
         pcm = np.rint(
             np.clip(
                 carrier,
@@ -423,7 +535,7 @@ class QIMSyncCodec:
             np.int64
         )
 
-        base = (
+        lattice = (
             np.floor_divide(
                 pcm,
                 self.base,
@@ -432,8 +544,9 @@ class QIMSyncCodec:
         )
 
         encoded = (
-            base
-            + symbols * self.step
+            lattice
+            + symbols
+            * self.step
         )
 
         safe_lo = -32734
@@ -468,12 +581,16 @@ class QIMSyncCodec:
         self,
         samples: np.ndarray,
     ) -> np.ndarray:
-
         samples = np.asarray(
             samples,
             dtype=np.float64,
         ).reshape(-1)
 
+        # app.py RX:
+        #
+        # int16 -> float / 32768
+        #
+        # so 32768 reconstructs received PCM integers.
         pcm = np.rint(
             np.clip(
                 samples,
@@ -494,11 +611,13 @@ class QIMSyncCodec:
         self,
         residues: np.ndarray,
     ) -> np.ndarray:
-
         residues = np.asarray(
             residues,
             dtype=np.int64,
-        ).reshape(-1, 1)
+        ).reshape(
+            -1,
+            1,
+        )
 
         direct = np.abs(
             residues
@@ -520,7 +639,6 @@ class QIMSyncCodec:
         np.ndarray,
         np.ndarray,
     ]:
-
         residues = (
             self._sample_residues(
                 samples
@@ -571,64 +689,64 @@ class QIMSyncCodec:
         samples: np.ndarray,
         digit_count: int,
     ) -> np.ndarray:
+        """
+        Decode interleaved/copy-major repeated payload.
+        """
 
         needed = (
             digit_count
             * self.repetition
         )
 
-        if samples.size < needed:
+        if (
+            samples.size
+            < needed
+        ):
             raise ValueError(
-                "not enough samples for QIM digits"
+                "not enough samples "
+                "for QIM digits"
             )
 
         residues = (
             self._sample_residues(
-                samples[:needed]
+                samples[
+                    :needed
+                ]
             )
         )
 
-        out = np.empty(
+        distances = (
+            self._distance_matrix(
+                residues
+            )
+        )
+
+        distances = distances.reshape(
+            self.repetition,
             digit_count,
-            dtype=np.int8,
+            4,
         )
 
-        for idx in range(
-            digit_count
-        ):
-            group = residues[
-                idx * self.repetition:
-                (idx + 1)
-                * self.repetition
-            ]
+        totals = np.sum(
+            distances,
+            axis=0,
+        )
 
-            distances = (
-                self._distance_matrix(
-                    group
-                )
-            )
-
-            totals = np.sum(
-                distances,
-                axis=0,
-            )
-
-            out[idx] = int(
-                np.argmin(
-                    totals
-                )
-            )
-
-        return out
+        return np.argmin(
+            totals,
+            axis=1,
+        ).astype(
+            np.int8
+        )
 
     def _decode_bytes(
         self,
         samples: np.ndarray,
         byte_count: int,
     ) -> bytes:
-
         digit_count = (
-            byte_count * 4
+            byte_count
+            * 4
         )
 
         digits = (
@@ -648,22 +766,31 @@ class QIMSyncCodec:
         self,
         samples_after_preamble: np.ndarray,
     ) -> int | None:
+        """
+        Compatibility helper only.
 
-        needed = (
-            4
-            * self.repetition
-        )
+        Streaming decoder below DOES NOT require exact hard header.
+        """
 
         if (
             samples_after_preamble.size
-            < needed
+            < 4
         ):
             return None
 
-        header = self._decode_bytes(
-            samples_after_preamble,
-            1,
-        )[0]
+        digits, _ = (
+            self._decode_sample_digits(
+                samples_after_preamble[
+                    :4
+                ]
+            )
+        )
+
+        header = (
+            self._base4_to_bytes(
+                digits
+            )[0]
+        )
 
         if (
             header
@@ -690,7 +817,6 @@ class QIMSyncCodec:
         int | None,
         float,
     ]:
-
         samples = np.asarray(
             samples,
             dtype=np.float64,
@@ -700,7 +826,10 @@ class QIMSyncCodec:
             self.preamble_samples
         )
 
-        if samples.size < n:
+        if (
+            samples.size
+            < n
+        ):
             return (
                 None,
                 0.0,
@@ -820,15 +949,20 @@ class QIMSyncCodec:
         self,
         marker: np.ndarray,
     ) -> SyncInfo:
+        """
+        Local/exact helper.
+
+        Real network RX uses soft decoder below.
+        """
 
         marker = np.asarray(
             marker,
             dtype=np.float64,
         ).reshape(-1)
 
-        if marker.size < (
-            self.preamble_samples
-            + 4 * self.repetition
+        if (
+            marker.size
+            < self.preamble_samples + 4
         ):
             raise ValueError(
                 "QIM marker is too short"
@@ -838,44 +972,62 @@ class QIMSyncCodec:
             self.preamble_samples:
         ]
 
-        packet_size = (
-            self._candidate_packet_size(
-                payload
-            )
-        )
-
-        if (
-            packet_size is None
-            or packet_size < 0
+        for packet_bytes in (
+            self.periodic_packet_bytes,
+            self.full_packet_bytes,
         ):
-            raise ValueError(
-                "unknown QIM sync marker header"
+            needed = (
+                packet_bytes
+                * 4
+                * self.repetition
             )
 
-        needed = (
-            packet_size
-            * 4
-            * self.repetition
-        )
+            if (
+                payload.size
+                < needed
+            ):
+                continue
 
-        packet = self._decode_bytes(
-            payload[:needed],
-            packet_size,
-        )
+            try:
+                packet = (
+                    self._decode_bytes(
+                        payload[
+                            :needed
+                        ],
+                        packet_bytes,
+                    )
+                )
 
-        return self._unpack(
-            packet
+                return (
+                    self._unpack(
+                        packet
+                    )
+                )
+
+            except ValueError:
+                pass
+
+        raise ValueError(
+            "could not decode QIM marker"
         )
 
 
 class QIMSyncStreamDecoder:
     """
-    Streaming QIM detector.
+    Streaming QIM decoder.
 
-    Дополнительно:
-    - детальная диагностика header;
-    - поиск небольшого sample shift;
-    - попытка recovery только если весь packet проходит CRC.
+    Main differences from old decoder:
+
+    1. Header does not have to hard-decode exactly.
+       Only A0 and A1 are legal hypotheses.
+
+    2. Every logical digit retains costs for ALL
+       four possible QIM symbols.
+
+    3. Beam search keeps several likely packet
+       interpretations.
+
+    4. Candidate is accepted ONLY if CRC32 passes.
     """
 
     def __init__(
@@ -889,21 +1041,28 @@ class QIMSyncStreamDecoder:
             dtype=np.float64,
         )
 
-        # repeat=4:
-        # проверяем +/-8 samples
-        # относительно границы preamble/header.
         self.phase_search_radius = max(
             8,
             2 * self.codec.repetition,
         )
 
+        # Number of complete packet candidates
+        # retained during soft decoding.
+        self.beam_width = 1024
+
+        # Avoid running a full beam over every
+        # shift/type combination.
+        self.max_hypotheses = 10
+
         self.total_preamble_hits = 0
         self.total_bad_header = 0
         self.total_crc_fail = 0
         self.total_decode_fail = 0
+
         self.total_periodic_ok = 0
         self.total_full_ok = 0
-        self.total_phase_recovered = 0
+
+        self.total_soft_repaired = 0
 
         self._diag_samples = 0
         self._diag_sum_squares = 0.0
@@ -915,110 +1074,18 @@ class QIMSyncStreamDecoder:
         self._diag_bad_header = 0
         self._diag_crc_fail = 0
         self._diag_decode_fail = 0
+
         self._diag_periodic_ok = 0
         self._diag_full_ok = 0
-        self._diag_phase_recovered = 0
+
+        self._diag_soft_repaired = 0
 
         self._diag_last_bad_header = None
-
-    def _record_audio(
-        self,
-        samples: np.ndarray,
-    ) -> None:
-
-        if samples.size == 0:
-            return
-
-        values = np.asarray(
-            samples,
-            dtype=np.float64,
-        ).reshape(-1)
-
-        self._diag_samples += int(
-            values.size
-        )
-
-        self._diag_sum_squares += float(
-            np.dot(
-                values,
-                values,
-            )
-        )
-
-        self._diag_peak = max(
-            self._diag_peak,
-            float(
-                np.max(
-                    np.abs(
-                        values
-                    )
-                )
-            ),
-        )
-
-    def _record_preamble_score(
-        self,
-        score: float,
-    ) -> None:
-
-        self._diag_best_preamble_score = max(
-            self._diag_best_preamble_score,
-            float(score),
-        )
-
-    def _record_preamble_hit(
-        self,
-    ) -> None:
-
-        self.total_preamble_hits += 1
-        self._diag_preamble_hits += 1
-
-    def _record_bad_header(
-        self,
-        header: int | None,
-    ) -> None:
-
-        self.total_bad_header += 1
-        self._diag_bad_header += 1
-        self._diag_last_bad_header = header
-
-    def _record_crc_fail(
-        self,
-    ) -> None:
-
-        self.total_crc_fail += 1
-        self._diag_crc_fail += 1
-
-    def _record_decode_fail(
-        self,
-    ) -> None:
-
-        self.total_decode_fail += 1
-        self._diag_decode_fail += 1
-
-    def _record_ok(
-        self,
-        info: SyncInfo,
-        phase_shift: int = 0,
-    ) -> None:
-
-        if info.is_full:
-            self.total_full_ok += 1
-            self._diag_full_ok += 1
-
-        else:
-            self.total_periodic_ok += 1
-            self._diag_periodic_ok += 1
-
-        if phase_shift != 0:
-            self.total_phase_recovered += 1
-            self._diag_phase_recovered += 1
 
     @staticmethod
     def _dbfs(
         value: float,
     ) -> float:
-
         if value <= 1e-12:
             return -240.0
 
@@ -1035,7 +1102,6 @@ class QIMSyncStreamDecoder:
     def _byte_digits(
         value: int,
     ) -> np.ndarray:
-
         return np.array(
             [
                 (value >> 6) & 0x03,
@@ -1046,108 +1112,91 @@ class QIMSyncStreamDecoder:
             dtype=np.int8,
         )
 
-    @staticmethod
-    def _digits_text(
-        digits: np.ndarray,
-    ) -> str:
-
-        return "".join(
-            str(
-                int(v)
-            )
-            for v
-            in np.asarray(
-                digits
-            ).reshape(-1)
-        )
-
-    def _decode_groups_debug(
+    def _record_audio(
         self,
         samples: np.ndarray,
-        digit_count: int,
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-    ]:
+    ) -> None:
+        if samples.size == 0:
+            return
 
-        needed = (
-            digit_count
-            * self.codec.repetition
+        x = np.asarray(
+            samples,
+            dtype=np.float64,
+        ).reshape(-1)
+
+        self._diag_samples += int(
+            x.size
         )
 
-        if samples.size < needed:
-            raise ValueError(
-                "not enough samples for QIM debug groups"
-            )
-
-        residues = (
-            self.codec._sample_residues(
-                samples[:needed]
+        self._diag_sum_squares += float(
+            np.dot(
+                x,
+                x,
             )
         )
 
-        residues = residues.reshape(
-            digit_count,
-            self.codec.repetition,
-        )
-
-        digits = np.empty(
-            digit_count,
-            dtype=np.int8,
-        )
-
-        costs = np.empty(
-            (
-                digit_count,
-                4,
-            ),
-            dtype=np.int64,
-        )
-
-        margins = np.empty(
-            digit_count,
-            dtype=np.int64,
-        )
-
-        for idx in range(
-            digit_count
-        ):
-            dist = (
-                self.codec._distance_matrix(
-                    residues[idx]
+        self._diag_peak = max(
+            self._diag_peak,
+            float(
+                np.max(
+                    np.abs(
+                        x
+                    )
                 )
-            )
-
-            summed = np.sum(
-                dist,
-                axis=0,
-            ).astype(
-                np.int64
-            )
-
-            costs[idx] = summed
-
-            order = np.argsort(
-                summed
-            )
-
-            digits[idx] = int(
-                order[0]
-            )
-
-            margins[idx] = int(
-                summed[order[1]]
-                - summed[order[0]]
-            )
-
-        return (
-            digits,
-            residues,
-            costs,
-            margins,
+            ),
         )
+
+    def _record_preamble_score(
+        self,
+        score: float,
+    ) -> None:
+        self._diag_best_preamble_score = max(
+            self._diag_best_preamble_score,
+            float(score),
+        )
+
+    def _record_preamble_hit(
+        self,
+    ) -> None:
+        self.total_preamble_hits += 1
+        self._diag_preamble_hits += 1
+
+    def _record_bad_header(
+        self,
+        header: int | None,
+    ) -> None:
+        self.total_bad_header += 1
+        self._diag_bad_header += 1
+        self._diag_last_bad_header = header
+
+    def _record_crc_fail(
+        self,
+    ) -> None:
+        self.total_crc_fail += 1
+        self._diag_crc_fail += 1
+
+    def _record_decode_fail(
+        self,
+    ) -> None:
+        self.total_decode_fail += 1
+        self._diag_decode_fail += 1
+
+    def _record_ok(
+        self,
+        info: SyncInfo,
+        repaired: bool,
+    ) -> None:
+        if info.is_full:
+            self.total_full_ok += 1
+            self._diag_full_ok += 1
+
+        else:
+            self.total_periodic_ok += 1
+            self._diag_periodic_ok += 1
+
+        if repaired:
+            self.total_soft_repaired += 1
+            self._diag_soft_repaired += 1
 
     def _logical_preamble_debug(
         self,
@@ -1155,20 +1204,44 @@ class QIMSyncStreamDecoder:
         str,
         int,
     ]:
-
         try:
-            got = (
-                self.codec._decode_digit_groups(
-                    self.buffer[
-                        :self.codec.preamble_samples
-                    ],
-                    int(
-                        self.codec.PREAMBLE_DIGITS.size
-                    ),
+            samples = self.buffer[
+                :self.codec.preamble_samples
+            ]
+
+            residues = (
+                self.codec._sample_residues(
+                    samples
                 )
             )
 
-        except ValueError:
+            distances = (
+                self.codec._distance_matrix(
+                    residues
+                )
+            )
+
+            distances = distances.reshape(
+                int(
+                    self.codec.PREAMBLE_DIGITS.size
+                ),
+                self.codec.repetition,
+                4,
+            )
+
+            totals = np.sum(
+                distances,
+                axis=1,
+            )
+
+            got = np.argmin(
+                totals,
+                axis=1,
+            ).astype(
+                np.int8
+            )
+
+        except Exception:
             return (
                 "short",
                 0,
@@ -1181,356 +1254,505 @@ class QIMSyncStreamDecoder:
             )
         )
 
+        text = "".join(
+            str(
+                int(v)
+            )
+            for v
+            in got
+        )
+
         return (
-            self._digits_text(
-                got
-            ),
+            text,
             matches,
         )
 
-    def _header_probe(
+    def _raw_header_first_copy(
         self,
-        shift: int,
-    ) -> dict | None:
-
-        start = (
-            self.codec.preamble_samples
-            + int(shift)
-        )
-
-        needed = (
-            4
-            * self.codec.repetition
-        )
-
-        if start < 0:
-            return None
-
+        payload_start: int,
+    ) -> int | None:
         if (
-            self.buffer.size
-            < start + needed
+            payload_start < 0
+            or self.buffer.size
+            < payload_start + 4
         ):
             return None
 
-        payload = self.buffer[
-            start:
-        ]
-
-        (
-            digits,
-            residues,
-            costs,
-            margins,
-        ) = self._decode_groups_debug(
-            payload,
-            4,
+        digits, _ = (
+            self.codec._decode_sample_digits(
+                self.buffer[
+                    payload_start:
+                    payload_start + 4
+                ]
+            )
         )
 
-        header = int(
+        return int(
             self.codec._base4_to_bytes(
                 digits
             )[0]
         )
 
-        periodic_digits = (
-            self._byte_digits(
-                self.codec.PERIODIC_HEADER
-            )
-        )
-
-        full_digits = (
-            self._byte_digits(
-                self.codec.FULL_HEADER
-            )
-        )
-
-        periodic_hamming = int(
-            np.sum(
-                digits
-                != periodic_digits
-            )
-        )
-
-        full_hamming = int(
-            np.sum(
-                digits
-                != full_digits
-            )
-        )
-
-        hamming = min(
-            periodic_hamming,
-            full_hamming,
-        )
-
-        periodic_cost = int(
-            sum(
-                costs[
-                    i,
-                    int(
-                        periodic_digits[i]
-                    ),
-                ]
-                for i
-                in range(4)
-            )
-        )
-
-        full_cost = int(
-            sum(
-                costs[
-                    i,
-                    int(
-                        full_digits[i]
-                    ),
-                ]
-                for i
-                in range(4)
-            )
-        )
-
-        expected_cost = min(
-            periodic_cost,
-            full_cost,
-        )
-
-        near = (
-            "A0"
-            if periodic_cost
-            <= full_cost
-            else "A1"
-        )
-
-        return {
-            "shift": int(
-                shift
-            ),
-            "start": int(
-                start
-            ),
-            "header": header,
-            "digits": digits,
-            "residues": residues,
-            "costs": costs,
-            "margins": margins,
-            "hamming": hamming,
-            "expected_cost": expected_cost,
-            "near": near,
-        }
-
-    def _ordered_phase_shifts(
+    def _header_cost_first_copy(
         self,
-    ) -> list[int]:
+        payload_start: int,
+        header: int,
+    ) -> int | None:
+        if (
+            payload_start < 0
+            or self.buffer.size
+            < payload_start + 4
+        ):
+            return None
 
-        out = [
-            0
-        ]
+        residues = (
+            self.codec._sample_residues(
+                self.buffer[
+                    payload_start:
+                    payload_start + 4
+                ]
+            )
+        )
 
-        for delta in range(
-            1,
+        distances = (
+            self.codec._distance_matrix(
+                residues
+            )
+        )
+
+        expected = (
+            self._byte_digits(
+                header
+            )
+        )
+
+        return int(
+            sum(
+                distances[
+                    i,
+                    int(
+                        expected[i]
+                    ),
+                ]
+                for i
+                in range(4)
+            )
+        )
+
+    def _build_hypotheses(
+        self,
+    ) -> tuple[
+        list[_SoftHypothesis],
+        bool,
+    ]:
+        hypotheses: list[
+            _SoftHypothesis
+        ] = []
+
+        waiting_for_full = False
+
+        for shift in range(
+            -self.phase_search_radius,
             self.phase_search_radius + 1,
         ):
-            out.extend(
+            start = (
+                self.codec.preamble_samples
+                + shift
+            )
+
+            if start < 0:
+                continue
+
+            raw_header = (
+                self._raw_header_first_copy(
+                    start
+                )
+            )
+
+            for (
+                header,
+                packet_bytes,
+            ) in (
                 (
-                    -delta,
-                    delta,
-                )
-            )
-
-        return out
-
-    def _candidate_diagnostic_line(
-        self,
-        score: float,
-        probes: list[dict],
-    ) -> None:
-
-        (
-            preamble_text,
-            preamble_matches,
-        ) = self._logical_preamble_debug()
-
-        nominal = next(
-            (
-                p
-                for p
-                in probes
-                if p["shift"] == 0
-            ),
-            None,
-        )
-
-        best = (
-            min(
-                probes,
-                key=lambda p: (
-                    p["hamming"],
-                    p["expected_cost"],
-                    abs(
-                        p["shift"]
-                    ),
+                    self.codec.PERIODIC_HEADER,
+                    self.codec.periodic_packet_bytes,
                 ),
+                (
+                    self.codec.FULL_HEADER,
+                    self.codec.full_packet_bytes,
+                ),
+            ):
+                hcost = (
+                    self._header_cost_first_copy(
+                        start,
+                        header,
+                    )
+                )
+
+                if hcost is None:
+                    continue
+
+                needed = (
+                    packet_bytes
+                    * 4
+                    * self.codec.repetition
+                )
+
+                if (
+                    self.buffer.size
+                    < start + needed
+                ):
+                    if (
+                        header
+                        == self.codec.FULL_HEADER
+                    ):
+                        waiting_for_full = True
+
+                    continue
+
+                hypotheses.append(
+                    _SoftHypothesis(
+                        shift=shift,
+                        header=header,
+                        packet_bytes=packet_bytes,
+                        header_cost=hcost,
+                        raw_header=raw_header,
+                    )
+                )
+
+        hypotheses.sort(
+            key=lambda h: (
+                h.header_cost,
+                abs(
+                    h.shift
+                ),
+                0
+                if h.header
+                == self.codec.FULL_HEADER
+                else 1,
             )
-            if probes
-            else None
         )
 
-        if nominal is None:
-            nominal_text = "none"
+        return (
+            hypotheses,
+            waiting_for_full,
+        )
 
-        else:
-            groups = [
-                ",".join(
-                    str(
-                        int(v)
+    def _payload_costs(
+        self,
+        start: int,
+        packet_bytes: int,
+    ) -> np.ndarray:
+        digit_count = (
+            packet_bytes
+            * 4
+        )
+
+        needed = (
+            digit_count
+            * self.codec.repetition
+        )
+
+        samples = self.buffer[
+            start:
+            start + needed
+        ]
+
+        if (
+            samples.size
+            < needed
+        ):
+            raise ValueError(
+                "not enough samples "
+                "for soft QIM payload"
+            )
+
+        residues = (
+            self.codec._sample_residues(
+                samples
+            )
+        )
+
+        distances = (
+            self.codec._distance_matrix(
+                residues
+            )
+        )
+
+        # encode() writes:
+        #
+        # payload copy 1
+        # payload copy 2
+        # ...
+        #
+        # so reshape is:
+        #
+        # [R][logical digit][possible symbol]
+        distances = distances.reshape(
+            self.codec.repetition,
+            digit_count,
+            4,
+        )
+
+        return np.sum(
+            distances,
+            axis=0,
+        ).astype(
+            np.int64
+        )
+
+    def _forced_hard_digits(
+        self,
+        costs: np.ndarray,
+        header: int,
+    ) -> np.ndarray:
+        hard = np.argmin(
+            costs,
+            axis=1,
+        ).astype(
+            np.int8
+        )
+
+        # Header is not arbitrary.
+        # It MUST be exactly A0 or A1.
+        hard[:4] = (
+            self._byte_digits(
+                header
+            )
+        )
+
+        return hard
+
+    def _crc_valid_packet(
+        self,
+        packet: bytes,
+    ) -> bool:
+        if len(packet) not in (
+            self.codec.periodic_packet_bytes,
+            self.codec.full_packet_bytes,
+        ):
+            return False
+
+        rx_crc = int.from_bytes(
+            packet[-4:],
+            "big",
+        )
+
+        calc_crc = (
+            self.codec._crc32(
+                packet[:-4]
+            )
+        )
+
+        return (
+            rx_crc
+            == calc_crc
+        )
+
+    def _soft_decode_hypothesis(
+        self,
+        hypothesis: _SoftHypothesis,
+    ) -> tuple[
+        SyncInfo,
+        int,
+        int,
+        bytes,
+    ] | None:
+        start = (
+            self.codec.preamble_samples
+            + hypothesis.shift
+        )
+
+        costs = (
+            self._payload_costs(
+                start,
+                hypothesis.packet_bytes,
+            )
+        )
+
+        digit_count = (
+            costs.shape[0]
+        )
+
+        expected_header_digits = (
+            self._byte_digits(
+                hypothesis.header
+            )
+        )
+
+        hard_digits = (
+            self._forced_hard_digits(
+                costs,
+                hypothesis.header,
+            )
+        )
+
+        hard_packet = (
+            self.codec._base4_to_bytes(
+                hard_digits
+            )
+        )
+
+        # Fast path:
+        #
+        # after aggregating all R payload copies,
+        # hard decision may already be correct.
+        if (
+            self._crc_valid_packet(
+                hard_packet
+            )
+        ):
+            try:
+                info = (
+                    self.codec._unpack(
+                        hard_packet
                     )
-                    for v
-                    in row
                 )
-                for row
-                in nominal["residues"]
+
+                return (
+                    info,
+                    0,
+                    0,
+                    hard_packet,
+                )
+
+            except ValueError:
+                pass
+
+        # Soft/list decoding.
+        #
+        # Beam element:
+        #
+        # (
+        #     total QIM distance,
+        #     tuple of chosen base4 digits
+        # )
+        #
+        # First four digits are constrained to
+        # legal packet header A0 or A1.
+        header_cost = int(
+            sum(
+                costs[
+                    i,
+                    int(
+                        expected_header_digits[i]
+                    ),
+                ]
+                for i
+                in range(4)
+            )
+        )
+
+        beam: list[
+            tuple[
+                int,
+                tuple[int, ...],
             ]
-
-            nominal_text = (
-                f"0x{nominal['header']:02X} "
-                f"digits={self._digits_text(nominal['digits'])} "
-                f"near={nominal['near']} "
-                f"hd={nominal['hamming']} "
-                f"margin="
-                f"{','.join(str(int(v)) for v in nominal['margins'])} "
-                f"res="
-                f"{'|'.join(groups)}"
-            )
-
-        if best is None:
-            best_text = "none"
-
-        else:
-            best_text = (
-                f"shift={best['shift']:+d} "
-                f"hdr=0x{best['header']:02X} "
-                f"digits="
-                f"{self._digits_text(best['digits'])} "
-                f"near={best['near']} "
-                f"hd={best['hamming']} "
-                f"cost={best['expected_cost']}"
-            )
-
-        exact_headers = [
+        ] = [
             (
-                f"{p['shift']:+d}:"
-                f"0x{p['header']:02X}"
-            )
-            for p
-            in probes
-            if p["header"]
-            in (
-                self.codec.PERIODIC_HEADER,
-                self.codec.FULL_HEADER,
+                header_cost,
+                tuple(
+                    int(v)
+                    for v
+                    in expected_header_digits
+                ),
             )
         ]
 
-        exact_text = (
-            ",".join(
-                exact_headers
-            )
-            if exact_headers
-            else "none"
-        )
-
-        print(
-            "QIM_PHY_CANDIDATE "
-            f"score={score:.3f} "
-            f"pre={preamble_matches}/16 "
-            f"got={preamble_text} "
-            f"nominal=[{nominal_text}] "
-            f"best=[{best_text}] "
-            f"exact_headers={exact_text}",
-            flush=True,
-        )
-
-    def _try_candidate_with_phase(
-        self,
-        score: float,
-    ) -> tuple[
-        str,
-        object | None,
-    ]:
-
-        probes = []
-
-        any_valid_header = False
-        any_crc_fail = False
-        any_decode_fail = False
-
-        need_more_for_valid_header = False
-
-        for shift in (
-            self._ordered_phase_shifts()
+        for pos in range(
+            4,
+            digit_count,
         ):
-            probe = (
-                self._header_probe(
-                    shift
-                )
-            )
-
-            if probe is None:
-                continue
-
-            probes.append(
-                probe
-            )
-
-            header = probe[
-                "header"
+            row = costs[
+                pos
             ]
 
-            if header not in (
-                self.codec.PERIODIC_HEADER,
-                self.codec.FULL_HEADER,
-            ):
-                continue
-
-            any_valid_header = True
-
-            packet_bytes = (
-                self.codec.full_packet_bytes
-                if header
-                == self.codec.FULL_HEADER
-                else self.codec.periodic_packet_bytes
+            # Try all 4 symbols, but in likely order.
+            order = np.argsort(
+                row
             )
 
-            payload_start = probe[
-                "start"
-            ]
+            expanded: list[
+                tuple[
+                    int,
+                    tuple[int, ...],
+                ]
+            ] = []
 
-            needed = (
-                packet_bytes
-                * 4
-                * self.codec.repetition
-            )
+            for (
+                current_cost,
+                digits,
+            ) in beam:
+                for choice in order:
+                    d = int(
+                        choice
+                    )
 
-            consume_len = (
-                payload_start
-                + needed
-            )
+                    expanded.append(
+                        (
+                            current_cost
+                            + int(
+                                row[d]
+                            ),
+                            digits
+                            + (d,),
+                        )
+                    )
 
             if (
-                self.buffer.size
-                < consume_len
+                len(expanded)
+                > self.beam_width
             ):
-                need_more_for_valid_header = True
-                continue
+                beam = heapq.nsmallest(
+                    self.beam_width,
+                    expanded,
+                    key=lambda item: item[0],
+                )
+
+            else:
+                expanded.sort(
+                    key=lambda item: item[0]
+                )
+
+                beam = expanded
+
+        beam.sort(
+            key=lambda item: item[0]
+        )
+
+        hard_arr = np.asarray(
+            hard_digits,
+            dtype=np.int8,
+        )
+
+        # We do NOT accept the lowest-distance packet blindly.
+        #
+        # We walk likely packets until one satisfies CRC32.
+        for (
+            rank,
+            (
+                _score,
+                digits_tuple,
+            ),
+        ) in enumerate(
+            beam,
+            start=1,
+        ):
+            candidate_digits = np.asarray(
+                digits_tuple,
+                dtype=np.int8,
+            )
 
             packet = (
-                self.codec._decode_bytes(
-                    self.buffer[
-                        payload_start:
-                        payload_start + needed
-                    ],
-                    packet_bytes,
+                self.codec._base4_to_bytes(
+                    candidate_digits
                 )
             )
+
+            if not self._crc_valid_packet(
+                packet
+            ):
+                continue
 
             try:
                 info = (
@@ -1539,123 +1761,266 @@ class QIMSyncStreamDecoder:
                     )
                 )
 
-            except ValueError as exc:
-                if (
-                    "CRC mismatch"
-                    in str(exc)
-                ):
-                    any_crc_fail = True
-
-                    rx_crc = (
-                        int.from_bytes(
-                            packet[-2:],
-                            "big",
-                        )
-                    )
-
-                    calc_crc = (
-                        self.codec._crc16(
-                            packet[:-2]
-                        )
-                    )
-
-                    print(
-                        "QIM_PHY_CRC_FAIL "
-                        f"score={score:.3f} "
-                        f"shift={shift:+d} "
-                        f"header=0x{header:02X} "
-                        f"packet={packet.hex()} "
-                        f"crc_rx=0x{rx_crc:04X} "
-                        f"crc_calc=0x{calc_crc:04X}",
-                        flush=True,
-                    )
-
-                else:
-                    any_decode_fail = True
-
+            except ValueError:
                 continue
 
-            self._candidate_diagnostic_line(
-                score,
-                probes,
+            if (
+                hypothesis.header
+                == self.codec.FULL_HEADER
+                and not info.is_full
+            ):
+                continue
+
+            if (
+                hypothesis.header
+                == self.codec.PERIODIC_HEADER
+                and info.is_full
+            ):
+                continue
+
+            changed = int(
+                np.sum(
+                    candidate_digits
+                    != hard_arr
+                )
             )
 
-            if shift != 0:
-                print(
-                    "QIM_PHY_PHASE_RECOVER "
-                    f"score={score:.3f} "
-                    f"shift={shift:+d} "
-                    f"header=0x{header:02X} "
-                    f"seq={info.sequence} "
-                    f"next={info.next_frame_index} "
-                    f"full={info.is_full}",
-                    flush=True,
+            return (
+                info,
+                rank,
+                changed,
+                packet,
+            )
+
+        return None
+
+    def _hard_failure_details(
+        self,
+        hypothesis: _SoftHypothesis,
+    ) -> tuple[
+        bytes,
+        int,
+        int,
+    ]:
+        start = (
+            self.codec.preamble_samples
+            + hypothesis.shift
+        )
+
+        costs = (
+            self._payload_costs(
+                start,
+                hypothesis.packet_bytes,
+            )
+        )
+
+        hard_digits = (
+            self._forced_hard_digits(
+                costs,
+                hypothesis.header,
+            )
+        )
+
+        packet = (
+            self.codec._base4_to_bytes(
+                hard_digits
+            )
+        )
+
+        rx_crc = int.from_bytes(
+            packet[-4:],
+            "big",
+        )
+
+        calc_crc = (
+            self.codec._crc32(
+                packet[:-4]
+            )
+        )
+
+        return (
+            packet,
+            rx_crc,
+            calc_crc,
+        )
+
+    def _try_candidate_soft(
+        self,
+        preamble_score: float,
+    ) -> tuple[
+        str,
+        object | None,
+    ]:
+        (
+            hypotheses,
+            waiting_for_full,
+        ) = self._build_hypotheses()
+
+        if not hypotheses:
+            if waiting_for_full:
+                return (
+                    "need_more",
+                    None,
                 )
+
+            return (
+                "decode_fail",
+                None,
+            )
+
+        (
+            preamble_text,
+            preamble_matches,
+        ) = (
+            self._logical_preamble_debug()
+        )
+
+        tried = 0
+
+        for hypothesis in hypotheses[
+            :self.max_hypotheses
+        ]:
+            tried += 1
+
+            try:
+                decoded = (
+                    self._soft_decode_hypothesis(
+                        hypothesis
+                    )
+                )
+
+            except Exception:
+                decoded = None
+
+            if decoded is None:
+                continue
+
+            (
+                info,
+                rank,
+                changed,
+                packet,
+            ) = decoded
+
+            repaired = (
+                rank != 0
+                or changed != 0
+                or hypothesis.shift != 0
+            )
+
+            consume_len = (
+                self.codec.preamble_samples
+                + hypothesis.shift
+                + hypothesis.packet_bytes
+                * 4
+                * self.codec.repetition
+            )
+
+            raw_header_text = (
+                "none"
+                if hypothesis.raw_header is None
+                else (
+                    f"0x"
+                    f"{hypothesis.raw_header:02X}"
+                )
+            )
+
+            print(
+                "QIM_SOFT_OK "
+                f"score={preamble_score:.3f} "
+                f"pre={preamble_matches}/"
+                f"{self.codec.PREAMBLE_DIGITS.size} "
+                f"shift={hypothesis.shift:+d} "
+                f"raw_header={raw_header_text} "
+                f"header=0x{hypothesis.header:02X} "
+                f"rank={rank} "
+                f"changed_digits={changed} "
+                f"seq={info.sequence} "
+                f"next={info.next_frame_index} "
+                f"full={info.is_full} "
+                f"repaired={repaired} "
+                f"packet={packet.hex()}",
+                flush=True,
+            )
 
             return (
                 "ok",
                 (
                     info,
                     consume_len,
-                    shift,
+                    repaired,
                 ),
             )
 
-        if need_more_for_valid_header:
-            return (
-                "need_more",
-                None,
-            )
+        best = hypotheses[0]
 
-        self._candidate_diagnostic_line(
-            score,
-            probes,
-        )
-
-        if any_crc_fail:
-            return (
-                "crc_fail",
-                None,
-            )
-
-        if (
-            any_valid_header
-            or any_decode_fail
-        ):
-            return (
-                "decode_fail",
-                None,
-            )
-
-        nominal = next(
+        try:
             (
-                p
-                for p
-                in probes
-                if p["shift"] == 0
-            ),
-            None,
+                hard_packet,
+                rx_crc,
+                calc_crc,
+            ) = (
+                self._hard_failure_details(
+                    best
+                )
+            )
+
+            hard_text = (
+                hard_packet.hex()
+            )
+
+            crc_text = (
+                f"crc_rx=0x{rx_crc:08X} "
+                f"crc_calc=0x{calc_crc:08X}"
+            )
+
+        except Exception:
+            hard_text = (
+                "unavailable"
+            )
+
+            crc_text = (
+                "crc_rx=none "
+                "crc_calc=none"
+            )
+
+        raw_header_text = (
+            "none"
+            if best.raw_header is None
+            else (
+                f"0x"
+                f"{best.raw_header:02X}"
+            )
         )
 
-        nominal_header = (
-            None
-            if nominal is None
-            else int(
-                nominal["header"]
-            )
+        print(
+            "QIM_SOFT_FAIL "
+            f"score={preamble_score:.3f} "
+            f"pre={preamble_matches}/"
+            f"{self.codec.PREAMBLE_DIGITS.size} "
+            f"got={preamble_text} "
+            f"tried={tried} "
+            f"best_shift={best.shift:+d} "
+            f"raw_header={raw_header_text} "
+            f"forced_header=0x{best.header:02X} "
+            f"header_cost={best.header_cost} "
+            f"hard_packet={hard_text} "
+            f"{crc_text}",
+            flush=True,
         )
 
         return (
-            "bad_header",
-            nominal_header,
+            "crc_fail",
+            best.raw_header,
         )
 
     def diagnostics_snapshot(
         self,
         reset_interval: bool = True,
     ) -> dict:
-
-        if self._diag_samples > 0:
+        if (
+            self._diag_samples > 0
+        ):
             rms = float(
                 np.sqrt(
                     self._diag_sum_squares
@@ -1704,8 +2069,8 @@ class QIMSyncStreamDecoder:
             "full_ok":
                 self._diag_full_ok,
 
-            "phase_recovered":
-                self._diag_phase_recovered,
+            "soft_repaired":
+                self._diag_soft_repaired,
 
             "last_bad_header":
                 self._diag_last_bad_header,
@@ -1733,8 +2098,8 @@ class QIMSyncStreamDecoder:
             "total_full_ok":
                 self.total_full_ok,
 
-            "total_phase_recovered":
-                self.total_phase_recovered,
+            "total_soft_repaired":
+                self.total_soft_repaired,
         }
 
         if reset_interval:
@@ -1748,9 +2113,11 @@ class QIMSyncStreamDecoder:
             self._diag_bad_header = 0
             self._diag_crc_fail = 0
             self._diag_decode_fail = 0
+
             self._diag_periodic_ok = 0
             self._diag_full_ok = 0
-            self._diag_phase_recovered = 0
+
+            self._diag_soft_repaired = 0
 
             self._diag_last_bad_header = None
 
@@ -1762,7 +2129,6 @@ class QIMSyncStreamDecoder:
     ) -> list[
         AudioData | SyncInfo
     ]:
-
         samples = np.asarray(
             samples,
             dtype=np.float64,
@@ -1798,7 +2164,10 @@ class QIMSyncStreamDecoder:
             ):
                 break
 
-            pos, score = (
+            (
+                pos,
+                score,
+            ) = (
                 self.codec.find_preamble(
                     self.buffer
                 )
@@ -1848,42 +2217,52 @@ class QIMSyncStreamDecoder:
 
                 continue
 
-            min_header = (
-                self.codec.preamble_samples
-                + 4
-                * self.codec.repetition
-            )
-
+            # Candidate begins at buffer[0].
+            #
+            # Need at least four first-copy payload samples
+            # before header hypotheses can be ranked.
             if (
                 self.buffer.size
-                < min_header
+                < self.codec.preamble_samples + 4
             ):
                 break
 
             self._record_preamble_hit()
 
-            status, data = (
-                self._try_candidate_with_phase(
+            (
+                status,
+                data,
+            ) = (
+                self._try_candidate_soft(
                     score
                 )
             )
 
-            if status == "need_more":
+            if (
+                status
+                == "need_more"
+            ):
+                # We counted it before finding out
+                # that complete FULL packet has not
+                # arrived yet.
                 self.total_preamble_hits -= 1
                 self._diag_preamble_hits -= 1
 
                 break
 
-            if status == "ok":
+            if (
+                status
+                == "ok"
+            ):
                 (
                     info,
                     consume_len,
-                    shift,
+                    repaired,
                 ) = data
 
                 self._record_ok(
                     info,
-                    phase_shift=shift,
+                    repaired,
                 )
 
                 marker_rx = (
@@ -1892,6 +2271,10 @@ class QIMSyncStreamDecoder:
                     ].copy()
                 )
 
+                # SyncInfo MUST be delivered first.
+                # app.py will set frame index / nonce
+                # before the QIM-modified audio region
+                # enters decrypt().
                 events.append(
                     info
                 )
@@ -1910,19 +2293,32 @@ class QIMSyncStreamDecoder:
 
                 continue
 
-            if status == "crc_fail":
+            if (
+                status
+                == "crc_fail"
+            ):
                 self._record_crc_fail()
 
-            elif status == "decode_fail":
-                self._record_decode_fail()
+                if data is not None:
+                    self._diag_last_bad_header = int(
+                        data
+                    )
 
-            else:
+            elif (
+                status
+                == "bad_header"
+            ):
                 self._record_bad_header(
                     data
                 )
 
-            # Reject only one sample:
-            # nearby real preamble must remain searchable.
+            else:
+                self._record_decode_fail()
+
+            # Reject only ONE sample.
+            #
+            # If this was a false/offset preamble,
+            # a real nearby preamble must stay searchable.
             events.append(
                 AudioData(
                     self.buffer[
@@ -1941,9 +2337,12 @@ class QIMSyncStreamDecoder:
 
     def flush(
         self,
-    ) -> list[AudioData]:
-
-        if self.buffer.size == 0:
+    ) -> list[
+        AudioData
+    ]:
+        if (
+            self.buffer.size == 0
+        ):
             return []
 
         out = [
