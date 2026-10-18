@@ -4,10 +4,12 @@ from __future__ import annotations
 import signal
 import subprocess
 import threading
+import queue
+import time
 from collections.abc import Callable
 
 
-RATE = 44100
+RATE = 48000
 CHANNELS = 1
 BLOCK = 1024
 
@@ -106,11 +108,13 @@ class PulseVirtualDevices:
             self.load_module(
                 "module-null-sink",
                 f"sink_name={TX_SINK}",
+                f"rate={RATE}",
                 "sink_properties=device.description=TX_sink",
             )
             self.load_module(
                 "module-null-sink",
                 f"sink_name={RX_SINK}",
+                f"rate={RATE}",
                 "sink_properties=device.description=RX_sink",
             )
             self.load_module(
@@ -205,18 +209,24 @@ class AudioBridge:
         speakers: str,
         process_tx: Callable[[bytes], bytes],
         process_rx: Callable[[bytes], bytes],
+        on_tx_gap: Callable[[int, int], None] | None = None,
+        on_rx_gap: Callable[[int, int], None] | None = None,
         rate: int = RATE,
         channels: int = CHANNELS,
         block: int = BLOCK,
+        queue_blocks: int = 4,
     ):
         self.mic = mic
         self.speakers = speakers
         self.process_tx = process_tx
         self.process_rx = process_rx
+        self.on_tx_gap = on_tx_gap
+        self.on_rx_gap = on_rx_gap
         self.rate = int(rate)
         self.channels = int(channels)
         self.block = int(block)
         self.block_bytes = self.block * self.channels * 2
+        self.queue_blocks = max(2, int(queue_blocks))
 
         self.processes: list[subprocess.Popen] = []
         self.processes_lock = threading.Lock()
@@ -250,6 +260,7 @@ class AudioBridge:
         sink: str,
         name: str,
         processor: Callable[[bytes], bytes],
+        on_gap: Callable[[int, int], None] | None,
     ) -> None:
         reader = subprocess.Popen(
             [
@@ -286,18 +297,90 @@ class AudioBridge:
         self._register_process(writer)
         print(name, "started")
 
+        # Capture is deliberately separated from processing. If a processor ever
+        # stalls, parec is still drained continuously and the OLDEST queued audio
+        # is dropped. This prevents the old 3-10 second backlog failure mode.
+        audio_queue: queue.Queue[tuple[int, bytes]] = queue.Queue(maxsize=self.queue_blocks)
+        capture_done = threading.Event()
+        dropped_blocks = 0
+        dropped_lock = threading.Lock()
+
+        def capture_loop() -> None:
+            nonlocal dropped_blocks
+            seq = 0
+            try:
+                assert reader.stdout is not None
+                while not stop_event.is_set():
+                    data = self._read_exact(reader.stdout, self.block_bytes)
+                    if not data:
+                        break
+
+                    item = (seq, data)
+                    seq += 1
+                    try:
+                        audio_queue.put_nowait(item)
+                    except queue.Full:
+                        # Real-time policy: throw away the OLDEST pending block,
+                        # never keep seconds of stale speech. Sequence numbers let
+                        # the processor notice the exact gap later and advance its
+                        # cipher state over synthetic zero audio.
+                        try:
+                            audio_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        with dropped_lock:
+                            dropped_blocks += 1
+                        try:
+                            audio_queue.put_nowait(item)
+                        except queue.Full:
+                            pass
+            finally:
+                capture_done.set()
+
+        capture_thread = threading.Thread(
+            target=capture_loop,
+            name=f"{name}-capture",
+            daemon=True,
+        )
+        capture_thread.start()
+
+        last_drop_report = time.monotonic()
+        last_reported_drops = 0
+
         try:
-            assert reader.stdout is not None
             assert writer.stdin is not None
+            expected_seq = 0
 
             while not stop_event.is_set():
-                data = self._read_exact(reader.stdout, self.block_bytes)
-                if not data:
-                    break
+                try:
+                    seq, data = audio_queue.get(timeout=0.10)
+                except queue.Empty:
+                    if capture_done.is_set():
+                        break
+                    continue
+
+                if seq > expected_seq and on_gap is not None:
+                    gap_blocks = int(seq - expected_seq)
+                    on_gap(gap_blocks, self.block)
+                expected_seq = int(seq + 1)
 
                 processed = processor(data)
                 if processed:
                     writer.stdin.write(processed)
+
+                now = time.monotonic()
+                if now - last_drop_report >= 2.0:
+                    with dropped_lock:
+                        current_drops = dropped_blocks
+                    if current_drops != last_reported_drops:
+                        print(
+                            f"{name} REALTIME_DROP "
+                            f"dropped_blocks={current_drops} "
+                            f"queue_max={self.queue_blocks}",
+                            flush=True,
+                        )
+                        last_reported_drops = current_drops
+                    last_drop_report = now
 
         except BrokenPipeError:
             pass
@@ -305,6 +388,17 @@ class AudioBridge:
             print(name, "error:", exc)
             stop_event.set()
         finally:
+            capture_done.set()
+            capture_thread.join(timeout=0.5)
+
+            with dropped_lock:
+                final_drops = dropped_blocks
+            if final_drops:
+                print(
+                    f"{name} REALTIME_DROP_TOTAL dropped_blocks={final_drops}",
+                    flush=True,
+                )
+
             for process in (reader, writer):
                 if process.poll() is None:
                     try:
@@ -317,12 +411,12 @@ class AudioBridge:
     def start(self) -> None:
         tx_thread = threading.Thread(
             target=self._pipe,
-            args=(self.mic, TX_SINK, "TX", self.process_tx),
+            args=(self.mic, TX_SINK, "TX", self.process_tx, self.on_tx_gap),
             daemon=True,
         )
         rx_thread = threading.Thread(
             target=self._pipe,
-            args=(RX_SOURCE, self.speakers, "RX", self.process_rx),
+            args=(RX_SOURCE, self.speakers, "RX", self.process_rx, self.on_rx_gap),
             daemon=True,
         )
 
