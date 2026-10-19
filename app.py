@@ -27,6 +27,7 @@ from crypto.mdct import MDCTCipher
 from crypto.stft import STFTCipher
 from robust_sync import (
     CheckpointInfo,
+    DetectedMarkerWindow,
     DetectedSyncEvent,
     RobustSyncCodec,
     RobustSyncStreamDecoder,
@@ -59,7 +60,16 @@ class LiveProcessor:
         sample_rate: int,
         sync_period_seconds: float,
         full_sync_period_seconds: float,
-        marker_amplitude: float,
+        full_marker_amplitude: float,
+        checkpoint_marker_amplitude: float,
+        full_audio_gain: float,
+        checkpoint_audio_gain: float,
+        full_preamble_ms: float,
+        full_symbol_ms: float,
+        checkpoint_preamble_ms: float,
+        checkpoint_symbol_ms: float,
+        full_detection_threshold: float,
+        checkpoint_detection_threshold: float,
         ciphertext_gain: float,
         node_name: str,
         sync_diag_interval: float,
@@ -68,6 +78,11 @@ class LiveProcessor:
         checkpoint_confirmations: int,
         checkpoint_max_drift: int,
         checkpoint_min_confidence: float,
+        rx_sync_mute: str,
+        rx_sync_lookahead_ms: float,
+        rx_full_mute_threshold: float,
+        rx_checkpoint_mute_threshold: float,
+        rx_sync_mute_fade_ms: float,
     ):
         if not (0.0 < ciphertext_gain <= 1.0):
             raise ValueError("ciphertext_gain must be in (0, 1]")
@@ -89,6 +104,33 @@ class LiveProcessor:
         self.ciphertext_gain = float(ciphertext_gain)
         self.hop_size = int(tx_cipher.hop_size)
 
+        if not (0.0 <= full_audio_gain <= 1.0):
+            raise ValueError("full_audio_gain must be in [0, 1]")
+        if not (0.0 <= checkpoint_audio_gain <= 1.0):
+            raise ValueError("checkpoint_audio_gain must be in [0, 1]")
+        if rx_sync_mute not in {"off", "checkpoint", "all"}:
+            raise ValueError("rx_sync_mute must be off, checkpoint or all")
+        if rx_sync_lookahead_ms < 0.0:
+            raise ValueError("rx_sync_lookahead_ms must be >= 0")
+        if not (0.0 <= rx_full_mute_threshold <= 1.0):
+            raise ValueError("rx_full_mute_threshold must be in [0, 1]")
+        if not (0.0 <= rx_checkpoint_mute_threshold <= 1.0):
+            raise ValueError("rx_checkpoint_mute_threshold must be in [0, 1]")
+        if rx_sync_mute_fade_ms < 0.0:
+            raise ValueError("rx_sync_mute_fade_ms must be >= 0")
+
+        self.full_audio_gain = float(full_audio_gain)
+        self.checkpoint_audio_gain = float(checkpoint_audio_gain)
+        self.rx_sync_mute = rx_sync_mute
+        self.rx_sync_lookahead_samples = int(
+            round(self.sample_rate * float(rx_sync_lookahead_ms) / 1000.0)
+        )
+        self.rx_full_mute_threshold = float(rx_full_mute_threshold)
+        self.rx_checkpoint_mute_threshold = float(rx_checkpoint_mute_threshold)
+        self.rx_sync_mute_fade_samples = int(
+            round(self.sample_rate * float(rx_sync_mute_fade_ms) / 1000.0)
+        )
+
         self.tx_sync = FrameSynchronizer(
             sample_rate=sample_rate,
             sync_period_seconds=sync_period_seconds,
@@ -102,7 +144,14 @@ class LiveProcessor:
 
         self.sync_codec = RobustSyncCodec(
             sample_rate=sample_rate,
-            marker_amplitude=marker_amplitude,
+            full_marker_amplitude=full_marker_amplitude,
+            checkpoint_marker_amplitude=checkpoint_marker_amplitude,
+            full_preamble_ms=full_preamble_ms,
+            full_symbol_ms=full_symbol_ms,
+            checkpoint_preamble_ms=checkpoint_preamble_ms,
+            checkpoint_symbol_ms=checkpoint_symbol_ms,
+            full_detection_threshold=full_detection_threshold,
+            checkpoint_detection_threshold=checkpoint_detection_threshold,
         )
         self.sync_decoder = RobustSyncStreamDecoder(
             self.sync_codec,
@@ -149,6 +198,16 @@ class LiveProcessor:
 
         self._rx_process_max_ms = 0.0
         self._rx_process_calls = 0
+
+        # RX speaker suppression.  Detector sees the original audio immediately,
+        # while playback/decrypt waits a short fixed look-ahead.  As soon as a
+        # sync preamble is recognized we know the complete marker interval and
+        # can silence that interval before it reaches local speakers.
+        self._rx_input_total_abs = 0
+        self._rx_hold_start_abs = 0
+        self._rx_hold = np.empty(0, dtype=np.float64)
+        self._rx_pending_events: list[DetectedSyncEvent] = []
+        self._rx_mute_intervals: list[tuple[int, int, str, float]] = []
 
     def _log(self, direction: str, event: str, **fields) -> None:
         ts = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
@@ -251,12 +310,12 @@ class LiveProcessor:
             # latency. FULL is intentionally stronger, checkpoint is lighter.
             if self.active_marker_kind == "FULL":
                 out[pos:pos + count] = (
-                    0.58 * out[pos:pos + count]
+                    self.full_audio_gain * out[pos:pos + count]
                     + marker_piece
                 )
             else:
                 out[pos:pos + count] = (
-                    0.82 * out[pos:pos + count]
+                    self.checkpoint_audio_gain * out[pos:pos + count]
                     + marker_piece
                 )
 
@@ -598,15 +657,16 @@ class LiveProcessor:
         if segment.size == 0:
             return
 
-    # Пока FULL не пойман — не глушим RX.
-    # Просто пропускаем входящий звук напрямую.
+        # Before initial FULL lock, never mute RX. Pass the received audio
+        # through unchanged so the Pulse/WebRTC path stays audible and can be
+        # diagnosed by ear. As soon as FULL is accepted, switch to normal
+        # decrypt mode at that exact stream position.
         if not self.rx_locked:
             output_parts.append(segment.copy())
             return
 
         ciphertext = segment / self.ciphertext_gain
         restored = self.rx_cipher.decrypt(ciphertext)
-
         if restored.size:
             output_parts.append(restored)
 
@@ -646,34 +706,220 @@ class LiveProcessor:
         self._rx_process_max_ms = 0.0
         self._rx_process_calls = 0
 
+        # RX speaker suppression.  Detector sees the original audio immediately,
+        # while playback/decrypt waits a short fixed look-ahead.  As soon as a
+        # sync preamble is recognized we know the complete marker interval and
+        # can silence that interval before it reaches local speakers.
+        self._rx_input_total_abs = 0
+        self._rx_hold_start_abs = 0
+        self._rx_hold = np.empty(0, dtype=np.float64)
+        self._rx_pending_events: list[DetectedSyncEvent] = []
+        self._rx_mute_intervals: list[tuple[int, int, str, float]] = []
+
+    def _should_mute_window(self, window: DetectedMarkerWindow) -> bool:
+        if self.rx_sync_mute == "off":
+            return False
+        if window.kind == "checkpoint":
+            if self.rx_sync_mute not in {"checkpoint", "all"}:
+                return False
+            return window.preamble_score >= self.rx_checkpoint_mute_threshold
+        if window.kind == "full":
+            if self.rx_sync_mute != "all":
+                return False
+            return window.preamble_score >= self.rx_full_mute_threshold
+        return False
+
+    def _add_mute_window(self, window: DetectedMarkerWindow) -> None:
+        if not self._should_mute_window(window):
+            return
+
+        start_abs = int(window.start_abs)
+        end_abs = int(window.end_abs)
+        if end_abs <= start_abs:
+            return
+
+        # Merge overlapping/adjacent windows.  False duplicate candidates around
+        # one real preamble therefore cannot create a forest of tiny intervals.
+        merged: list[tuple[int, int, str, float]] = []
+        inserted = False
+        for old_start, old_end, old_kind, old_score in self._rx_mute_intervals:
+            if old_end < start_abs - 1 or end_abs < old_start - 1:
+                merged.append((old_start, old_end, old_kind, old_score))
+                continue
+            start_abs = min(start_abs, old_start)
+            end_abs = max(end_abs, old_end)
+            window_kind = window.kind if window.kind == old_kind else "mixed"
+            window_score = max(float(window.preamble_score), float(old_score))
+            window = DetectedMarkerWindow(
+                kind=window_kind,
+                start_abs=start_abs,
+                end_abs=end_abs,
+                preamble_score=window_score,
+            )
+            inserted = True
+
+        merged.append(
+            (
+                start_abs,
+                end_abs,
+                window.kind,
+                float(window.preamble_score),
+            )
+        )
+        merged.sort(key=lambda item: item[0])
+        self._rx_mute_intervals = merged
+
+        self._log(
+            "RX<-REMOTE",
+            "SYNC MUTE",
+            kind=window.kind,
+            preamble=f"{window.preamble_score:.3f}",
+            marker_ms=f"{1000.0 * (end_abs - start_abs) / self.sample_rate:.1f}",
+        )
+
+    def _mask_sync_audio(self, samples: np.ndarray, start_abs: int) -> np.ndarray:
+        if samples.size == 0 or not self._rx_mute_intervals:
+            return samples
+
+        out = samples.copy()
+        seg_start = int(start_abs)
+        seg_end = seg_start + int(out.size)
+        fade = max(0, int(self.rx_sync_mute_fade_samples))
+
+        for mute_start, mute_end, _kind, _score in self._rx_mute_intervals:
+            left = max(seg_start, mute_start)
+            right = min(seg_end, mute_end)
+            if right <= left:
+                continue
+
+            i0 = left - seg_start
+            i1 = right - seg_start
+            gain = np.zeros(i1 - i0, dtype=np.float64)
+
+            if fade > 0:
+                # Fade down just inside the marker start and fade back up just
+                # before marker end.  This prevents hard zero-boundary clicks.
+                for idx in range(i1 - i0):
+                    abs_pos = left + idx
+                    dist_from_start = abs_pos - mute_start
+                    dist_to_end = mute_end - abs_pos - 1
+                    edge = min(dist_from_start, dist_to_end)
+                    if edge < fade:
+                        # 1.0 at the outer marker boundary -> 0.0 after the
+                        # short fade, and symmetrically back to 1.0 at the end.
+                        gain[idx] = np.cos(
+                            0.5 * np.pi * max(0.0, float(edge)) / float(fade)
+                        ) ** 2
+
+            out[i0:i1] *= gain
+
+        return out
+
+    def _process_released_audio(
+        self,
+        raw: np.ndarray,
+        raw_start_abs: int,
+    ) -> bytes:
+        if raw.size == 0:
+            return b""
+
+        raw_start_abs = int(raw_start_abs)
+        raw_end_abs = raw_start_abs + int(raw.size)
+        output_parts: list[np.ndarray] = []
+        cursor_abs = raw_start_abs
+
+        self._rx_pending_events.sort(key=lambda event: event.end_abs)
+
+        while self._rx_pending_events and self._rx_pending_events[0].end_abs <= raw_end_abs:
+            event = self._rx_pending_events.pop(0)
+            event_end = max(cursor_abs, min(int(event.end_abs), raw_end_abs))
+
+            if event_end > cursor_abs:
+                i0 = cursor_abs - raw_start_abs
+                i1 = event_end - raw_start_abs
+                piece = self._mask_sync_audio(raw[i0:i1], cursor_abs)
+                self._decrypt_segment(piece, output_parts)
+
+            self._handle_detected_event(event)
+            cursor_abs = event_end
+
+        if cursor_abs < raw_end_abs:
+            i0 = cursor_abs - raw_start_abs
+            piece = self._mask_sync_audio(raw[i0:], cursor_abs)
+            self._decrypt_segment(piece, output_parts)
+
+        if not output_parts:
+            return b""
+        return self._float_to_bytes(np.concatenate(output_parts))
+
     def process_rx(self, data: bytes) -> bytes:
         started = time.perf_counter()
         incoming = self._bytes_to_float(data)
+        block_start_abs = int(self._rx_input_total_abs)
+        block_end_abs = block_start_abs + int(incoming.size)
+
+        # Detector always receives untouched WebRTC audio.  Speaker muting is a
+        # separate branch and therefore cannot make sync detection worse.
         events = self.sync_decoder.feed(incoming)
-        events.sort(key=lambda event: event.end_offset)
+        windows = self.sync_decoder.pop_marker_windows()
 
-        output_parts: list[np.ndarray] = []
-        cursor = 0
+        for window in windows:
+            self._add_mute_window(window)
 
-        # Process audio up to each marker END with the old state, then apply the
-        # event at that exact stream position. For initial FULL, pre-lock audio is
-        # simply discarded; data after the FULL boundary uses the new state.
-        for event in events:
-            end = max(cursor, min(int(event.end_offset), int(incoming.size)))
-            self._decrypt_segment(incoming[cursor:end], output_parts)
-            self._handle_detected_event(event)
-            cursor = end
+        self._rx_pending_events.extend(events)
+        self._rx_input_total_abs = block_end_abs
 
-        self._decrypt_segment(incoming[cursor:], output_parts)
+        if incoming.size:
+            if self._rx_hold.size == 0:
+                self._rx_hold_start_abs = block_start_abs
+            self._rx_hold = np.concatenate((self._rx_hold, incoming))
+
+        release_until_abs = max(
+            self._rx_hold_start_abs,
+            block_end_abs - self.rx_sync_lookahead_samples,
+        )
+        release_count = min(
+            int(self._rx_hold.size),
+            max(0, int(release_until_abs - self._rx_hold_start_abs)),
+        )
+
+        if release_count > 0:
+            release_start_abs = int(self._rx_hold_start_abs)
+            released = self._rx_hold[:release_count].copy()
+            self._rx_hold = self._rx_hold[release_count:]
+            self._rx_hold_start_abs += release_count
+            out_bytes = self._process_released_audio(released, release_start_abs)
+        else:
+            out_bytes = b""
+
+        # Remove mute windows that are fully behind the playback cursor.
+        self._rx_mute_intervals = [
+            interval
+            for interval in self._rx_mute_intervals
+            if interval[1] > self._rx_hold_start_abs
+        ]
+
+        # A decoded event should normally still be ahead of the delayed playback
+        # cursor.  If the user intentionally sets too little look-ahead, apply a
+        # late event immediately rather than letting it sit forever.
+        late_events = [
+            event
+            for event in self._rx_pending_events
+            if event.end_abs <= self._rx_hold_start_abs
+        ]
+        if late_events:
+            for event in sorted(late_events, key=lambda item: item.end_abs):
+                self._handle_detected_event(event)
+            late_ids = {id(event) for event in late_events}
+            self._rx_pending_events = [
+                event for event in self._rx_pending_events if id(event) not in late_ids
+            ]
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._rx_process_calls += 1
         self._rx_process_max_ms = max(self._rx_process_max_ms, elapsed_ms)
         self._maybe_log_sync_diagnostics()
-
-        if not output_parts:
-            return b""
-        return self._float_to_bytes(np.concatenate(output_parts))
+        return out_bytes
 
 
 def build_cipher(
@@ -721,7 +967,26 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="rare CRC32 absolute re-anchor interval",
     )
-    parser.add_argument("--marker-amplitude", type=float, default=0.30)
+    parser.add_argument(
+        "--full-marker-amplitude",
+        type=float,
+        default=0.30,
+        help="FULL modem base amplitude",
+    )
+    parser.add_argument(
+        "--checkpoint-marker-amplitude",
+        type=float,
+        default=0.30,
+        help="checkpoint modem base amplitude; historical 0.80/0.72 internal ratios remain",
+    )
+    parser.add_argument("--full-audio-gain", type=float, default=0.58)
+    parser.add_argument("--checkpoint-audio-gain", type=float, default=0.82)
+    parser.add_argument("--full-preamble-ms", type=float, default=60.0)
+    parser.add_argument("--full-symbol-ms", type=float, default=8.0)
+    parser.add_argument("--checkpoint-preamble-ms", type=float, default=16.0)
+    parser.add_argument("--checkpoint-symbol-ms", type=float, default=5.0)
+    parser.add_argument("--full-detection-threshold", type=float, default=0.50)
+    parser.add_argument("--checkpoint-detection-threshold", type=float, default=0.48)
     parser.add_argument("--ciphertext-gain", type=float, default=0.68)
     parser.add_argument(
         "--initial-full-repeats",
@@ -746,6 +1011,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.30,
         help="reject weak periodic checkpoint decodes",
+    )
+    parser.add_argument(
+        "--rx-sync-mute",
+        choices=["off", "checkpoint", "all"],
+        default="all",
+        help="suppress detected modem markers from local speakers",
+    )
+    parser.add_argument(
+        "--rx-sync-lookahead-ms",
+        type=float,
+        default=100.0,
+        help="fixed RX look-ahead used to mute a marker from its beginning",
+    )
+    parser.add_argument(
+        "--rx-full-mute-threshold",
+        type=float,
+        default=0.70,
+        help="minimum FULL preamble score before local speaker muting",
+    )
+    parser.add_argument(
+        "--rx-checkpoint-mute-threshold",
+        type=float,
+        default=0.50,
+        help="minimum checkpoint preamble score before local speaker muting",
+    )
+    parser.add_argument(
+        "--rx-sync-mute-fade-ms",
+        type=float,
+        default=3.0,
+        help="fade at mute window edges to avoid clicks",
     )
     parser.add_argument(
         "--sync-diag-interval",
@@ -877,7 +1172,16 @@ def run(args: argparse.Namespace) -> None:
         sample_rate=RATE,
         sync_period_seconds=args.sync_period,
         full_sync_period_seconds=args.full_sync_period,
-        marker_amplitude=args.marker_amplitude,
+        full_marker_amplitude=args.full_marker_amplitude,
+        checkpoint_marker_amplitude=args.checkpoint_marker_amplitude,
+        full_audio_gain=args.full_audio_gain,
+        checkpoint_audio_gain=args.checkpoint_audio_gain,
+        full_preamble_ms=args.full_preamble_ms,
+        full_symbol_ms=args.full_symbol_ms,
+        checkpoint_preamble_ms=args.checkpoint_preamble_ms,
+        checkpoint_symbol_ms=args.checkpoint_symbol_ms,
+        full_detection_threshold=args.full_detection_threshold,
+        checkpoint_detection_threshold=args.checkpoint_detection_threshold,
         ciphertext_gain=args.ciphertext_gain,
         node_name=args.node,
         sync_diag_interval=args.sync_diag_interval,
@@ -886,6 +1190,11 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_confirmations=args.checkpoint_confirmations,
         checkpoint_max_drift=args.checkpoint_max_drift,
         checkpoint_min_confidence=args.checkpoint_min_confidence,
+        rx_sync_mute=args.rx_sync_mute,
+        rx_sync_lookahead_ms=args.rx_sync_lookahead_ms,
+        rx_full_mute_threshold=args.rx_full_mute_threshold,
+        rx_checkpoint_mute_threshold=args.rx_checkpoint_mute_threshold,
+        rx_sync_mute_fade_ms=args.rx_sync_mute_fade_ms,
     )
 
     virtual_devices = PulseVirtualDevices()
@@ -901,6 +1210,12 @@ def run(args: argparse.Namespace) -> None:
     print("Sync                : robust chirp + DTMF-like modem")
     print("Sync period         :", args.sync_period, "s")
     print("Full refresh period :", args.full_sync_period, "s")
+    print("FULL base amplitude :", args.full_marker_amplitude)
+    print("CP base amplitude   :", args.checkpoint_marker_amplitude)
+    print("FULL audio gain     :", args.full_audio_gain)
+    print("CP audio gain       :", args.checkpoint_audio_gain)
+    print("RX sync mute        :", args.rx_sync_mute)
+    print("RX mute lookahead   :", args.rx_sync_lookahead_ms, "ms")
     print("Initial FULL x      :", args.initial_full_repeats)
     print("Checkpoint modulo   : 64")
     print("Checkpoint confirms :", args.checkpoint_confirmations)

@@ -40,10 +40,27 @@ class CheckpointInfo:
 
 @dataclass(frozen=True)
 class DetectedSyncEvent:
-    """A sync event whose marker ends inside the latest feed() block."""
+    """Decoded sync event with both relative and absolute stream positions."""
 
+    start_abs: int
+    end_abs: int
     end_offset: int
     payload: SyncInfo | CheckpointInfo
+    preamble_score: float
+
+
+@dataclass(frozen=True)
+class DetectedMarkerWindow:
+    """Marker window announced as soon as its preamble is detected.
+
+    This is intentionally earlier than full payload decode.  app.py can keep a
+    short RX look-ahead buffer and suppress the modem from local speakers while
+    the detector still sees the untouched samples.
+    """
+
+    kind: str  # full | checkpoint
+    start_abs: int
+    end_abs: int
     preamble_score: float
 
 
@@ -65,6 +82,8 @@ class RobustSyncCodec:
         self,
         sample_rate: int = 48000,
         marker_amplitude: float = 0.30,
+        full_marker_amplitude: float | None = None,
+        checkpoint_marker_amplitude: float | None = None,
         full_preamble_ms: float = 60.0,
         full_symbol_ms: float = 8.0,
         checkpoint_preamble_ms: float = 16.0,
@@ -78,11 +97,24 @@ class RobustSyncCodec:
             raise ValueError("sample_rate must be > 0")
         if not (0.0 < marker_amplitude <= 0.8):
             raise ValueError("marker_amplitude must be in (0, 0.8]")
+
+        if full_marker_amplitude is None:
+            full_marker_amplitude = marker_amplitude
+        if checkpoint_marker_amplitude is None:
+            checkpoint_marker_amplitude = marker_amplitude
+        if not (0.0 < float(full_marker_amplitude) <= 0.8):
+            raise ValueError("full_marker_amplitude must be in (0, 0.8]")
+        if not (0.0 < float(checkpoint_marker_amplitude) <= 0.8):
+            raise ValueError("checkpoint_marker_amplitude must be in (0, 0.8]")
         if checkpoint_modulus != 64:
             raise ValueError("current checkpoint wire format requires modulus=64")
 
         self.sample_rate = int(sample_rate)
+        # marker_amplitude is kept as a compatibility alias.  The two real
+        # controls below can now be tuned independently from the command line.
         self.marker_amplitude = float(marker_amplitude)
+        self.full_marker_amplitude = float(full_marker_amplitude)
+        self.checkpoint_marker_amplitude = float(checkpoint_marker_amplitude)
         self.full_detection_threshold = float(full_detection_threshold)
         self.checkpoint_detection_threshold = float(checkpoint_detection_threshold)
         self.checkpoint_min_confidence = float(checkpoint_min_confidence)
@@ -114,25 +146,28 @@ class RobustSyncCodec:
             self.full_preamble_samples,
             700.0,
             5600.0,
-            amplitude=self.marker_amplitude,
+            amplitude=self.full_marker_amplitude,
         )
         # Opposite sweep direction distinguishes short checkpoints from FULL.
+        # The historical 0.80 / 0.72 ratios are preserved so existing default
+        # behaviour stays the same; checkpoint_marker_amplitude is the new base
+        # knob exposed by app.py.
         self._checkpoint_preamble = self._build_chirp(
             self.checkpoint_preamble_samples,
             5200.0,
             1200.0,
-            amplitude=self.marker_amplitude * 0.80,
+            amplitude=self.checkpoint_marker_amplitude * 0.80,
         )
 
         self._full_symbols = [
-            self._build_symbol(i, self.full_symbol_samples, self.marker_amplitude)
+            self._build_symbol(i, self.full_symbol_samples, self.full_marker_amplitude)
             for i in range(16)
         ]
         self._checkpoint_symbols = [
             self._build_symbol(
                 i,
                 self.checkpoint_symbol_samples,
-                self.marker_amplitude * 0.72,
+                self.checkpoint_marker_amplitude * 0.72,
             )
             for i in range(16)
         ]
@@ -515,6 +550,7 @@ class RobustSyncStreamDecoder:
         self._total_abs = 0
         self._next_search_abs = 0
         self._candidate: _Candidate | None = None
+        self._new_marker_windows: list[DetectedMarkerWindow] = []
 
         # Coarse correlation stride. At 48 kHz, 8 samples ~= 0.17 ms.
         self._search_step = 2
@@ -626,6 +662,14 @@ class RobustSyncStreamDecoder:
                         start_abs=refined_abs,
                         preamble_score=refined_score,
                     )
+                    self._new_marker_windows.append(
+                        DetectedMarkerWindow(
+                            kind="full",
+                            start_abs=int(refined_abs),
+                            end_abs=int(refined_abs + self.full_marker_samples),
+                            preamble_score=float(refined_score),
+                        )
+                    )
                     return self._candidate
 
             cp_score = self._score_at("checkpoint", pos)
@@ -643,12 +687,22 @@ class RobustSyncStreamDecoder:
                         start_abs=refined_abs,
                         preamble_score=refined_score,
                     )
+                    self._new_marker_windows.append(
+                        DetectedMarkerWindow(
+                            kind="checkpoint",
+                            start_abs=int(refined_abs),
+                            end_abs=int(refined_abs + self.checkpoint_marker_samples),
+                            preamble_score=float(refined_score),
+                        )
+                    )
                     return self._candidate
 
         self._next_search_abs = latest_start + 1
         return None
 
-    def _decode_candidate(self) -> tuple[int, SyncInfo | CheckpointInfo, float] | None:
+    def _decode_candidate(
+        self,
+    ) -> tuple[int, int, SyncInfo | CheckpointInfo, float] | None:
         candidate = self._candidate
         if candidate is None:
             return None
@@ -676,7 +730,7 @@ class RobustSyncStreamDecoder:
             score = candidate.preamble_score
             self._candidate = None
             self._next_search_abs = end_abs
-            return end_abs, payload, score
+            return candidate.start_abs, end_abs, payload, score
 
         except ValueError:
             if candidate.kind == "full":
@@ -690,7 +744,7 @@ class RobustSyncStreamDecoder:
             # exact same preamble forever.
             self._next_search_abs = candidate.start_abs + self._search_step
             self._candidate = None
-            return (-1, CheckpointInfo(0, 0.0), candidate.preamble_score)
+            return (candidate.start_abs, -1, CheckpointInfo(0, 0.0), candidate.preamble_score)
 
     def skip_samples(self, count: int) -> None:
         """Tell detector that audio samples were deliberately dropped upstream.
@@ -708,6 +762,18 @@ class RobustSyncStreamDecoder:
         self._buffer_start_abs = self._total_abs
         self._next_search_abs = self._total_abs
         self._candidate = None
+        self._new_marker_windows.clear()
+
+    def pop_marker_windows(self) -> list[DetectedMarkerWindow]:
+        """Return newly detected marker windows since the last call.
+
+        Windows are announced immediately after preamble detection, before the
+        full payload has necessarily arrived.  This lets the audio path suppress
+        modem audio with only a short look-ahead delay.
+        """
+        out = self._new_marker_windows
+        self._new_marker_windows = []
+        return out
 
     def feed(self, samples: np.ndarray) -> list[DetectedSyncEvent]:
         x = np.asarray(samples, dtype=np.float64).reshape(-1)
@@ -738,7 +804,7 @@ class RobustSyncStreamDecoder:
             decoded = self._decode_candidate()
             if decoded is None:
                 break
-            end_abs, payload, preamble_score = decoded
+            start_abs, end_abs, payload, preamble_score = decoded
             if end_abs < 0:
                 continue
 
@@ -748,6 +814,8 @@ class RobustSyncStreamDecoder:
             end_offset = int(np.clip(end_abs - feed_start_abs, 0, x.size))
             events.append(
                 DetectedSyncEvent(
+                    start_abs=int(start_abs),
+                    end_abs=int(end_abs),
                     end_offset=end_offset,
                     payload=payload,
                     preamble_score=float(preamble_score),
