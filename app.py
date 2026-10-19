@@ -595,10 +595,18 @@ class LiveProcessor:
             self._handle_checkpoint(event.payload, event.preamble_score)
 
     def _decrypt_segment(self, segment: np.ndarray, output_parts: list[np.ndarray]) -> None:
-        if segment.size == 0 or not self.rx_locked:
+        if segment.size == 0:
             return
+
+    # Пока FULL не пойман — не глушим RX.
+    # Просто пропускаем входящий звук напрямую.
+        if not self.rx_locked:
+            output_parts.append(segment.copy())
+            return
+
         ciphertext = segment / self.ciphertext_gain
         restored = self.rx_cipher.decrypt(ciphertext)
+
         if restored.size:
             output_parts.append(restored)
 
