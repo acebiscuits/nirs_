@@ -706,15 +706,9 @@ class LiveProcessor:
         self._rx_process_max_ms = 0.0
         self._rx_process_calls = 0
 
-        # RX speaker suppression.  Detector sees the original audio immediately,
-        # while playback/decrypt waits a short fixed look-ahead.  As soon as a
-        # sync preamble is recognized we know the complete marker interval and
-        # can silence that interval before it reaches local speakers.
-        self._rx_input_total_abs = 0
-        self._rx_hold_start_abs = 0
-        self._rx_hold = np.empty(0, dtype=np.float64)
-        self._rx_pending_events: list[DetectedSyncEvent] = []
-        self._rx_mute_intervals: list[tuple[int, int, str, float]] = []
+        # IMPORTANT: do not reset RX look-ahead/mute absolute state here.
+        # Those cursors must remain monotonic for the lifetime of the stream.
+        # diagnostics_snapshot() resets only interval counters inside the detector.
 
     def _should_mute_window(self, window: DetectedMarkerWindow) -> bool:
         if self.rx_sync_mute == "off":
