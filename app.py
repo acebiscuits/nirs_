@@ -457,11 +457,17 @@ class LiveProcessor:
         )
 
     def on_rx_gap(self, dropped_blocks: int, block_samples: int) -> None:
-        """Advance RX over dropped stale PCM instead of building latency.
+        """Advance RX over discarded real-time PCM without desynchronizing cursors.
 
-        Missing ciphertext is represented by zero PCM solely to advance streaming
-        state/frame counters. Output for the gap is discarded. Detector history is
-        reset so no preamble can straddle the discontinuity.
+        The sync decoder and the speaker look-ahead use the same absolute sample
+        timeline.  When AudioBridge drops queued blocks, BOTH timelines must jump
+        by exactly the discarded sample count.  Older versions advanced only the
+        decoder cursor; after the first RX drop every later mute window was shifted
+        and modem chirps leaked to the speakers even though SYNC MUTE was logged.
+
+        Audio already sitting in the short look-ahead buffer has been seen by the
+        detector but not yet by the decryptor.  Consume it for cipher/event state
+        and discard its playback before jumping over the actually missing blocks.
         """
         dropped_blocks = max(0, int(dropped_blocks))
         block_samples = max(1, int(block_samples))
@@ -469,7 +475,28 @@ class LiveProcessor:
             return
 
         skipped_samples = dropped_blocks * block_samples
+
+        # Bring decrypt/event state up to the end of audio that was already fed to
+        # the detector but was still waiting in the speaker look-ahead.  Its output
+        # is intentionally discarded: after a real-time drop we prefer the live edge.
+        held_samples = int(self._rx_hold.size)
+        if held_samples > 0:
+            self._process_released_audio(
+                self._rx_hold.copy(),
+                int(self._rx_hold_start_abs),
+            )
+            self._rx_hold = np.empty(0, dtype=np.float64)
+            self._rx_hold_start_abs = int(self._rx_input_total_abs)
+
+        # A discontinuity invalidates candidate windows/events that straddle it.
+        self._rx_pending_events.clear()
+        self._rx_mute_intervals.clear()
+
+        # Keep detector absolute coordinates and LiveProcessor playback coordinates
+        # on the SAME timeline.  This is essential for marker suppression.
         self.sync_decoder.skip_samples(skipped_samples)
+        self._rx_input_total_abs += skipped_samples
+        self._rx_hold_start_abs = int(self._rx_input_total_abs)
 
         before = int(self.rx_cipher.frame_index)
         if self.rx_locked:
@@ -480,10 +507,14 @@ class LiveProcessor:
 
         self._pending_checkpoint_drift = None
         self._pending_checkpoint_count = 0
+        self._large_drift_estimate = None
+        self._large_drift_count = 0
         self._log(
             "RX<-REMOTE",
             "REALTIME GAP",
             dropped_blocks=dropped_blocks,
+            skipped_samples=skipped_samples,
+            discarded_lookahead_samples=held_samples,
             frame_before=before,
             frame_after=after,
             locked=self.rx_locked,
@@ -593,10 +624,10 @@ class LiveProcessor:
         drift = int(resolved - local)
 
         if cp.confidence < self.checkpoint_min_confidence:
-            self._pending_checkpoint_drift = None
-            self._pending_checkpoint_count = 0
-            self._large_drift_estimate = None
-            self._large_drift_count = 0
+            # A weak observation carries no evidence either way.  Ignore it
+            # instead of erasing a good 1/2 or 2/3 hypothesis accumulated from
+            # previous strong checkpoints.  A later contradictory *strong*
+            # checkpoint will replace the hypothesis normally.
             self._log(
                 "RX<-REMOTE",
                 "CHECKPOINT REJECT",
@@ -633,10 +664,8 @@ class LiveProcessor:
             # is never auto-applied.
             ambiguous_limit = cp.modulus // 2
             if abs(drift) >= ambiguous_limit:
-                self._pending_checkpoint_drift = None
-                self._pending_checkpoint_count = 0
-                self._large_drift_estimate = None
-                self._large_drift_count = 0
+                # This observation is unusable because modulo-N cannot choose a
+                # direction, but it also does not disprove an existing hypothesis.
                 self._log(
                     "RX<-REMOTE",
                     "CHECKPOINT REJECT",
@@ -651,10 +680,9 @@ class LiveProcessor:
                 return
 
             if cp.confidence < self.checkpoint_large_drift_min_confidence:
-                self._pending_checkpoint_drift = None
-                self._pending_checkpoint_count = 0
-                self._large_drift_estimate = None
-                self._large_drift_count = 0
+                # Same rule as above: a weak large-drift decode is simply ignored.
+                # Do not destroy a stable hypothesis because one checkpoint was
+                # mangled by WebRTC.
                 self._log(
                     "RX<-REMOTE",
                     "CHECKPOINT REJECT",

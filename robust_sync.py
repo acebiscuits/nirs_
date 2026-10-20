@@ -553,7 +553,11 @@ class RobustSyncStreamDecoder:
         self._new_marker_windows: list[DetectedMarkerWindow] = []
 
         # Coarse correlation stride. At 48 kHz, 8 samples ~= 0.17 ms.
-        self._search_step = 2
+        # The previous value was accidentally 2, which made the detector do
+        # roughly 4x more correlation work than intended and pushed RX close to
+        # (or beyond) the 21.3 ms real-time block budget. Fine alignment is still
+        # recovered by _refine() over +/-32 samples.
+        self._search_step = 8
         self._refine_radius = 32
 
         self._diag_samples = 0
@@ -740,16 +744,17 @@ class RobustSyncStreamDecoder:
                 self.total_checkpoint_fail += 1
                 self._diag_checkpoint_fail += 1
 
-            # Do not rescan the same failed checkpoint every 2 samples.
-            # A lossy WebRTC marker can produce many nearby high-correlation
-            # offsets; retrying all of them caused 100+ candidates per interval
-            # and stalled the real-time RX path.  A failed checkpoint is cheap
-            # to lose because the next one arrives soon, so skip this marker
-            # window and stay at the live edge.  FULL remains conservative.
+            # A failed marker must not be rediscovered a few samples later.
+            # _refine() has already searched +/-32 samples for the best preamble
+            # alignment and FULL decode already performs bounded CRC-aided repair.
+            # Retrying the same damaged FULL at offsets +8,+16,... produced 10-12
+            # FULL candidates, 140-250 ms RX stalls and real-time queue drops.
+            # Skip the entire failed marker window; the next checkpoint/FULL is
+            # more useful than replaying the same corrupted candidate.
             if candidate.kind == "checkpoint":
                 self._next_search_abs = candidate.start_abs + self.checkpoint_marker_samples
             else:
-                self._next_search_abs = candidate.start_abs + self._search_step
+                self._next_search_abs = candidate.start_abs + self.full_marker_samples
             self._candidate = None
             return (candidate.start_abs, -1, CheckpointInfo(0, 0.0), candidate.preamble_score)
 
