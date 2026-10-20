@@ -78,6 +78,9 @@ class LiveProcessor:
         checkpoint_confirmations: int,
         checkpoint_max_drift: int,
         checkpoint_min_confidence: float,
+        checkpoint_large_drift_confirmations: int,
+        checkpoint_large_drift_tolerance: int,
+        checkpoint_large_drift_min_confidence: float,
         rx_sync_mute: str,
         rx_sync_lookahead_ms: float,
         rx_full_mute_threshold: float,
@@ -94,6 +97,12 @@ class LiveProcessor:
             raise ValueError("checkpoint_max_drift must be >= 1")
         if not (0.0 <= checkpoint_min_confidence <= 1.0):
             raise ValueError("checkpoint_min_confidence must be in [0, 1]")
+        if checkpoint_large_drift_confirmations < 2:
+            raise ValueError("checkpoint_large_drift_confirmations must be >= 2")
+        if checkpoint_large_drift_tolerance < 0:
+            raise ValueError("checkpoint_large_drift_tolerance must be >= 0")
+        if not (0.0 <= checkpoint_large_drift_min_confidence <= 1.0):
+            raise ValueError("checkpoint_large_drift_min_confidence must be in [0, 1]")
         if tx_cipher.hop_size != rx_cipher.hop_size:
             raise ValueError("TX and RX hop sizes must match")
 
@@ -166,10 +175,21 @@ class LiveProcessor:
         self.checkpoint_confirmations = int(checkpoint_confirmations)
         self.checkpoint_max_drift = int(checkpoint_max_drift)
         self.checkpoint_min_confidence = float(checkpoint_min_confidence)
+        self.checkpoint_large_drift_confirmations = int(checkpoint_large_drift_confirmations)
+        self.checkpoint_large_drift_tolerance = int(checkpoint_large_drift_tolerance)
+        self.checkpoint_large_drift_min_confidence = float(checkpoint_large_drift_min_confidence)
 
         self.rx_locked = False
         self._pending_checkpoint_drift: int | None = None
         self._pending_checkpoint_count = 0
+
+        # Large-drift reacquisition is intentionally separate from the normal
+        # +/- few-frame correction path.  A single modulo checkpoint is never
+        # allowed to jump the decryptor by a large amount.  Several consecutive
+        # high-confidence checkpoints must independently point to approximately
+        # the same offset first.
+        self._large_drift_estimate: float | None = None
+        self._large_drift_count = 0
 
         self.tx_warmup_done = False
         self.pending_marker: _PendingMarker | None = None
@@ -542,6 +562,8 @@ class LiveProcessor:
 
         self._pending_checkpoint_drift = None
         self._pending_checkpoint_count = 0
+        self._large_drift_estimate = None
+        self._large_drift_count = 0
 
         self._log(
             "RX<-REMOTE",
@@ -573,6 +595,8 @@ class LiveProcessor:
         if cp.confidence < self.checkpoint_min_confidence:
             self._pending_checkpoint_drift = None
             self._pending_checkpoint_count = 0
+            self._large_drift_estimate = None
+            self._large_drift_count = 0
             self._log(
                 "RX<-REMOTE",
                 "CHECKPOINT REJECT",
@@ -583,34 +607,124 @@ class LiveProcessor:
             )
             return
 
-        if abs(drift) > self.checkpoint_max_drift:
+        # Normal tracking path: small corrections are cheap and can use the
+        # existing confirmation rule.  A zero-drift checkpoint also clears any
+        # stale large-drift hypothesis.
+        if abs(drift) <= self.checkpoint_max_drift:
+            self._large_drift_estimate = None
+            self._large_drift_count = 0
+
+            if drift == 0:
+                self._pending_checkpoint_drift = None
+                self._pending_checkpoint_count = 0
+                self._log(
+                    "RX<-REMOTE",
+                    "CHECKPOINT TRACK",
+                    mod=cp.frame_mod,
+                    confidence=f"{cp.confidence:.3f}",
+                    local=local,
+                    drift=0,
+                    preamble=f"{preamble_score:.3f}",
+                )
+                return
+        else:
+            # modulo-N can only identify an offset inside roughly +/- N/2.
+            # Exactly N/2 is ambiguous (e.g. +32 and -32 for modulo 64), so it
+            # is never auto-applied.
+            ambiguous_limit = cp.modulus // 2
+            if abs(drift) >= ambiguous_limit:
+                self._pending_checkpoint_drift = None
+                self._pending_checkpoint_count = 0
+                self._large_drift_estimate = None
+                self._large_drift_count = 0
+                self._log(
+                    "RX<-REMOTE",
+                    "CHECKPOINT REJECT",
+                    reason="ambiguous_modulo_drift",
+                    mod=cp.frame_mod,
+                    confidence=f"{cp.confidence:.3f}",
+                    local=local,
+                    resolved=resolved,
+                    drift=drift,
+                    modulus=cp.modulus,
+                )
+                return
+
+            if cp.confidence < self.checkpoint_large_drift_min_confidence:
+                self._pending_checkpoint_drift = None
+                self._pending_checkpoint_count = 0
+                self._large_drift_estimate = None
+                self._large_drift_count = 0
+                self._log(
+                    "RX<-REMOTE",
+                    "CHECKPOINT REJECT",
+                    reason="large_drift_low_confidence",
+                    mod=cp.frame_mod,
+                    confidence=f"{cp.confidence:.3f}",
+                    local=local,
+                    resolved=resolved,
+                    drift=drift,
+                    min_confidence=f"{self.checkpoint_large_drift_min_confidence:.3f}",
+                )
+                return
+
+            # Do not let the normal small-drift confirmation state leak into a
+            # large reacquisition decision.
             self._pending_checkpoint_drift = None
             self._pending_checkpoint_count = 0
+
+            if (
+                self._large_drift_estimate is not None
+                and abs(drift - self._large_drift_estimate)
+                <= self.checkpoint_large_drift_tolerance
+            ):
+                self._large_drift_count += 1
+                # Running mean makes +25,+26,+26 count as one stable hypothesis
+                # instead of three unrelated exact integers.
+                self._large_drift_estimate += (
+                    float(drift) - self._large_drift_estimate
+                ) / float(self._large_drift_count)
+            else:
+                self._large_drift_estimate = float(drift)
+                self._large_drift_count = 1
+
+            if self._large_drift_count < self.checkpoint_large_drift_confirmations:
+                self._log(
+                    "RX<-REMOTE",
+                    "CHECKPOINT LARGE_SUSPECT",
+                    mod=cp.frame_mod,
+                    confidence=f"{cp.confidence:.3f}",
+                    local=local,
+                    resolved=resolved,
+                    drift=drift,
+                    estimate=f"{self._large_drift_estimate:.2f}",
+                    confirmations=(
+                        f"{self._large_drift_count}/"
+                        f"{self.checkpoint_large_drift_confirmations}"
+                    ),
+                    tolerance=self.checkpoint_large_drift_tolerance,
+                )
+                return
+
+            # The current checkpoint is itself modulo-consistent and belongs to
+            # the stable hypothesis, so re-anchor to its exact resolved frame.
+            estimate = self._large_drift_estimate
+            confirmations = self._large_drift_count
+            self.rx_cipher.set_frame_index(resolved)
             self._log(
                 "RX<-REMOTE",
-                "CHECKPOINT REJECT",
-                reason="implausible_drift",
+                "CHECKPOINT LARGE_APPLY",
                 mod=cp.frame_mod,
                 confidence=f"{cp.confidence:.3f}",
-                local=local,
+                local_before=local,
                 resolved=resolved,
                 drift=drift,
-                max_drift=self.checkpoint_max_drift,
-            )
-            return
-
-        if drift == 0:
-            self._pending_checkpoint_drift = None
-            self._pending_checkpoint_count = 0
-            self._log(
-                "RX<-REMOTE",
-                "CHECKPOINT TRACK",
-                mod=cp.frame_mod,
-                confidence=f"{cp.confidence:.3f}",
-                local=local,
-                drift=0,
+                estimate=f"{estimate:.2f}",
+                confirmations=confirmations,
                 preamble=f"{preamble_score:.3f}",
             )
+            self._large_drift_estimate = None
+            self._large_drift_count = 0
             return
 
         if self._pending_checkpoint_drift == drift:
@@ -700,6 +814,11 @@ class LiveProcessor:
                 "none"
                 if self._pending_checkpoint_drift is None
                 else self._pending_checkpoint_drift
+            ),
+            large_drift=(
+                "none"
+                if self._large_drift_estimate is None
+                else f"{self._large_drift_estimate:.2f}:{self._large_drift_count}"
             ),
             rx_proc_max_ms=f"{self._rx_process_max_ms:.2f}",
         )
@@ -1007,6 +1126,24 @@ def parse_args() -> argparse.Namespace:
         help="reject weak periodic checkpoint decodes",
     )
     parser.add_argument(
+        "--checkpoint-large-drift-confirmations",
+        type=int,
+        default=3,
+        help="high-confidence large drift must persist this many checkpoints before re-anchor",
+    )
+    parser.add_argument(
+        "--checkpoint-large-drift-tolerance",
+        type=int,
+        default=2,
+        help="large-drift observations within +/- this many frames belong to one hypothesis",
+    )
+    parser.add_argument(
+        "--checkpoint-large-drift-min-confidence",
+        type=float,
+        default=0.60,
+        help="minimum confidence for large modulo re-acquisition",
+    )
+    parser.add_argument(
         "--rx-sync-mute",
         choices=["off", "checkpoint", "all"],
         default="all",
@@ -1184,6 +1321,9 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_confirmations=args.checkpoint_confirmations,
         checkpoint_max_drift=args.checkpoint_max_drift,
         checkpoint_min_confidence=args.checkpoint_min_confidence,
+        checkpoint_large_drift_confirmations=args.checkpoint_large_drift_confirmations,
+        checkpoint_large_drift_tolerance=args.checkpoint_large_drift_tolerance,
+        checkpoint_large_drift_min_confidence=args.checkpoint_large_drift_min_confidence,
         rx_sync_mute=args.rx_sync_mute,
         rx_sync_lookahead_ms=args.rx_sync_lookahead_ms,
         rx_full_mute_threshold=args.rx_full_mute_threshold,
@@ -1214,6 +1354,9 @@ def run(args: argparse.Namespace) -> None:
     print("Checkpoint modulo   : 64")
     print("Checkpoint confirms :", args.checkpoint_confirmations)
     print("Checkpoint max drift:", args.checkpoint_max_drift, "frames")
+    print("Large drift confirms:", args.checkpoint_large_drift_confirmations)
+    print("Large drift tolerance:", args.checkpoint_large_drift_tolerance, "frames")
+    print("Large drift min conf :", args.checkpoint_large_drift_min_confidence)
     print("FULL marker         :", f"{1000.0 * processor.sync_codec.full_marker_samples_for(processor.hop_size) / RATE:.1f} ms")
     print("Checkpoint marker   :", f"{1000.0 * processor.sync_codec.checkpoint_marker_samples_for(processor.hop_size) / RATE:.1f} ms")
 
