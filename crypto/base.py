@@ -10,7 +10,7 @@ class SpectralCipher(ABC):
     def __init__(
         self,
         operation: str,
-        key: bytes | None = None,
+        key: bytes,
         key_schedule: str = "fixed",
     ):
         if key_schedule not in self.SUPPORTED_KEY_SCHEDULES:
