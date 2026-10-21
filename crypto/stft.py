@@ -19,7 +19,6 @@ class STFTCipher(SpectralCipher):
         self,
         operation: str,
         key: bytes | None = None,
-        session_nonce: str = "stft-live-v1",
         key_schedule: str = "per_frame",#опции: fixed, per_frame
         frame_size: int = 2048,
         hop_size: int = 1024,
@@ -28,7 +27,6 @@ class STFTCipher(SpectralCipher):
         super().__init__(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
 
@@ -92,7 +90,7 @@ class STFTCipher(SpectralCipher):
             if spectrum.shape[0] <= 2:
                 return spectrum
 
-            rng = self._rng_for_frame("stft-signflip")
+            rng = self._rng_for_frame()
             mask = rng.choice(
                 np.array([-1.0, 1.0]),
                 size=spectrum.shape[0] - 2,
@@ -102,7 +100,7 @@ class STFTCipher(SpectralCipher):
             return spectrum
 
         if self.operation == "shuffle":
-            rng = self._rng_for_frame("stft-shuffle")
+            rng = self._rng_for_frame()
             perm = rng.permutation(spectrum.shape[0])
 
             if decrypt:
@@ -113,10 +111,6 @@ class STFTCipher(SpectralCipher):
         # if self.operation == "shuffle": - тут аналог того что выше, но с сохранением dc и Nyquist
         #     if spectrum.shape[0] <= 2:
         #         return spectrum
-
-        #     rng = self._rng_for_frame(
-        #         "stft-shuffle"
-        #     )
 
         #     inner_perm = rng.permutation(
         #         spectrum.shape[0] - 2
