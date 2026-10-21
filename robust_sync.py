@@ -74,20 +74,17 @@ class _Candidate:
 class RobustSyncCodec:
     """Audio modem optimized for Opus/WebRTC instead of sample-exact QIM."""
 
-    FULL_MAGIC = b"RS"
-    FULL_VERSION = 1
-    CHECKPOINT_MAGIC = 0b10  # top two bits of one checkpoint byte
-
     def __init__(
         self,
         sample_rate: int = 48000,
-        marker_amplitude: float = 0.30,
-        full_marker_amplitude: float | None = None,
-        checkpoint_marker_amplitude: float | None = None,
+        full_preamble_amplitude: float = 0.30,
+        full_symbol_amplitude: float = 0.16,
+        checkpoint_preamble_amplitude: float = 0.30,
+        checkpoint_symbol_amplitude: float = 0.14,
         full_preamble_ms: float = 60.0,
         full_symbol_ms: float = 8.0,
         checkpoint_preamble_ms: float = 16.0,
-        checkpoint_symbol_ms: float = 5.0,
+        checkpoint_symbol_ms: float = 4.0,
         full_detection_threshold: float = 0.50,
         checkpoint_detection_threshold: float = 0.48,
         checkpoint_min_confidence: float = 0.20,
@@ -95,26 +92,22 @@ class RobustSyncCodec:
     ):
         if sample_rate <= 0:
             raise ValueError("sample_rate must be > 0")
-        if not (0.0 < marker_amplitude <= 0.8):
-            raise ValueError("marker_amplitude must be in (0, 0.8]")
-
-        if full_marker_amplitude is None:
-            full_marker_amplitude = marker_amplitude
-        if checkpoint_marker_amplitude is None:
-            checkpoint_marker_amplitude = marker_amplitude
-        if not (0.0 < float(full_marker_amplitude) <= 0.8):
-            raise ValueError("full_marker_amplitude must be in (0, 0.8]")
-        if not (0.0 < float(checkpoint_marker_amplitude) <= 0.8):
-            raise ValueError("checkpoint_marker_amplitude must be in (0, 0.8]")
+        for name, value in (
+            ("full_preamble_amplitude", full_preamble_amplitude),
+            ("full_symbol_amplitude", full_symbol_amplitude),
+            ("checkpoint_preamble_amplitude", checkpoint_preamble_amplitude),
+            ("checkpoint_symbol_amplitude", checkpoint_symbol_amplitude),
+        ):
+            if not (0.0 < float(value) <= 0.8):
+                raise ValueError(f"{name} must be in (0, 0.8]")
         if checkpoint_modulus != 64:
             raise ValueError("current checkpoint wire format requires modulus=64")
 
         self.sample_rate = int(sample_rate)
-        # marker_amplitude is kept as a compatibility alias.  The two real
-        # controls below can now be tuned independently from the command line.
-        self.marker_amplitude = float(marker_amplitude)
-        self.full_marker_amplitude = float(full_marker_amplitude)
-        self.checkpoint_marker_amplitude = float(checkpoint_marker_amplitude)
+        self.full_preamble_amplitude = float(full_preamble_amplitude)
+        self.full_symbol_amplitude = float(full_symbol_amplitude)
+        self.checkpoint_preamble_amplitude = float(checkpoint_preamble_amplitude)
+        self.checkpoint_symbol_amplitude = float(checkpoint_symbol_amplitude)
         self.full_detection_threshold = float(full_detection_threshold)
         self.checkpoint_detection_threshold = float(checkpoint_detection_threshold)
         self.checkpoint_min_confidence = float(checkpoint_min_confidence)
@@ -146,29 +139,21 @@ class RobustSyncCodec:
             self.full_preamble_samples,
             700.0,
             5600.0,
-            amplitude=self.full_marker_amplitude,
+            amplitude=self.full_preamble_amplitude,
         )
-        # Opposite sweep direction distinguishes short checkpoints from FULL.
-        # The historical 0.80 / 0.72 ratios are preserved so existing default
-        # behaviour stays the same; checkpoint_marker_amplitude is the new base
-        # knob exposed by app.py.
         self._checkpoint_preamble = self._build_chirp(
             self.checkpoint_preamble_samples,
             5200.0,
             1200.0,
-            amplitude=self.checkpoint_marker_amplitude * 0.80,
+            amplitude=self.checkpoint_preamble_amplitude,
         )
 
         self._full_symbols = [
-            self._build_symbol(i, self.full_symbol_samples, self.full_marker_amplitude)
+            self._build_symbol(i, self.full_symbol_samples, self.full_symbol_amplitude)
             for i in range(16)
         ]
         self._checkpoint_symbols = [
-            self._build_symbol(
-                i,
-                self.checkpoint_symbol_samples,
-                self.checkpoint_marker_amplitude * 0.72,
-            )
+            self._build_symbol(i, self.checkpoint_symbol_samples, self.checkpoint_symbol_amplitude)
             for i in range(16)
         ]
 
@@ -186,16 +171,6 @@ class RobustSyncCodec:
     @staticmethod
     def _crc32(data: bytes) -> int:
         return binascii.crc32(data) & 0xFFFFFFFF
-
-    @staticmethod
-    def _nonce_to_bytes(nonce: str) -> bytes:
-        try:
-            raw = bytes.fromhex(nonce)
-        except ValueError as exc:
-            raise ValueError("session_nonce must be hexadecimal") from exc
-        if len(raw) != 16:
-            raise ValueError("session_nonce must be exactly 16 bytes / 32 hex chars")
-        return raw
 
     def _build_chirp(
         self,
@@ -235,8 +210,8 @@ class RobustSyncCodec:
 
     @property
     def full_packet_bytes(self) -> int:
-        # 2-byte magic + version + uint32 end-frame + 16-byte nonce + CRC32
-        return 2 + 1 + 4 + 16 + 4
+        # uint32 end-frame + CRC32
+        return 4 + 4
 
     @property
     def full_raw_samples(self) -> int:
@@ -270,37 +245,28 @@ class RobustSyncCodec:
         return self.checkpoint_span_frames(hop_size) * hop_size
 
     def _pack_full(self, info: SyncInfo) -> bytes:
-        if not info.is_full or info.session_nonce is None:
-            raise ValueError("FULL marker requires session_nonce")
+        if not info.is_full:
+            raise ValueError("FULL marker requires is_full=True")
         if not (0 <= info.next_frame_index < 2**32):
             raise ValueError("next_frame_index must fit uint32")
 
-        body = bytearray(self.FULL_MAGIC)
-        body.append(self.FULL_VERSION)
-        body.extend(int(info.next_frame_index).to_bytes(4, "big"))
-        body.extend(self._nonce_to_bytes(info.session_nonce))
-        crc = self._crc32(bytes(body))
-        body.extend(crc.to_bytes(4, "big"))
-        return bytes(body)
+        data = int(info.next_frame_index).to_bytes(4, "big")
+        crc = self._crc32(data)
+        return data + crc.to_bytes(4, "big")
 
     def _unpack_full(self, packet: bytes) -> SyncInfo:
         if len(packet) != self.full_packet_bytes:
             raise ValueError("wrong FULL packet length")
-        data = packet[:-4]
-        crc_rx = int.from_bytes(packet[-4:], "big")
+        data = packet[:4]
+        crc_rx = int.from_bytes(packet[4:8], "big")
         if self._crc32(data) != crc_rx:
             raise ValueError("FULL CRC32 mismatch")
-        if data[:2] != self.FULL_MAGIC:
-            raise ValueError("FULL magic mismatch")
-        if data[2] != self.FULL_VERSION:
-            raise ValueError("FULL version mismatch")
 
-        next_frame = int.from_bytes(data[3:7], "big")
-        nonce = data[7:23].hex()
+        next_frame = int.from_bytes(data, "big")
         return SyncInfo(
             next_frame_index=next_frame,
             sequence=0,
-            session_nonce=nonce,
+            is_full=True,
         )
 
     @staticmethod
@@ -330,7 +296,7 @@ class RobustSyncCodec:
 
     def encode_checkpoint(self, frame_index: int, hop_size: int) -> np.ndarray:
         mod = int(frame_index) % self.checkpoint_modulus
-        byte = (self.CHECKPOINT_MAGIC << 6) | mod
+        byte = mod
         hi = (byte >> 4) & 0x0F
         lo = byte & 0x0F
         parts = [self._checkpoint_preamble]
@@ -401,7 +367,7 @@ class RobustSyncCodec:
         switch to their second/third correlation choice. This is intentionally
         tiny (<= 51 repaired packets), so it cannot recreate the old multi-second
         beam-search stalls. A repaired FULL is still accepted only if CRC32,
-        magic and version are all valid.
+        the CRC32 is valid.
         """
         marker = np.asarray(marker, dtype=np.float64).reshape(-1)
         needed = self.full_raw_samples
@@ -467,7 +433,7 @@ class RobustSyncCodec:
                     except ValueError:
                         continue
 
-        raise ValueError("FULL CRC32/magic/version recovery failed")
+        raise ValueError("FULL CRC32 recovery failed")
 
     def decode_checkpoint_from(self, marker: np.ndarray) -> CheckpointInfo:
         marker = np.asarray(marker, dtype=np.float64).reshape(-1)
@@ -492,15 +458,15 @@ class RobustSyncCodec:
             pos += self.checkpoint_symbol_samples
 
             value = ((hi & 0x0F) << 4) | (lo & 0x0F)
-            if (value >> 6) != self.CHECKPOINT_MAGIC:
+            if value >= self.checkpoint_modulus:
                 continue
 
             # Blend margin confidence with absolute template fit.
             conf = 0.7 * min(c_hi, c_lo) + 0.3 * min(s_hi, s_lo)
-            decoded.append((value & 0x3F, float(conf)))
+            decoded.append((value, float(conf)))
 
         if not decoded:
-            raise ValueError("checkpoint magic not recovered")
+            raise ValueError("checkpoint value not recovered")
 
         weight_by_value: dict[int, float] = {}
         count_by_value: dict[int, int] = {}

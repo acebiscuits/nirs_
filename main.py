@@ -119,7 +119,7 @@ def run_tx(args, key, folder, events):
             devices = PulseVirtualDevices(); devices.start()
             print('Telemost microphone: TX_Microphone. Configure your call, then press Enter.', flush=True)
             input('TX: ENTER to begin transmission > ')
-            source = subprocess.Popen(['parecord','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1'], stdout=subprocess.PIPE, bufsize=0)
+            source = subprocess.Popen(['parecord','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1'], stdout=subprocess.PIPE, bufsize=1)
             player = subprocess.Popen(['paplay','--raw',f'--device={TX_SINK}','--rate=20000','--format=s16le','--channels=1'], stdin=subprocess.PIPE, bufsize=0)
             read_frame = lambda: source.stdout.read(VOICE_FRAME * 2)
         with wav(folder/'tx_plain.wav', VOICE_RATE) as plain, wav(folder/'tx_wire.wav', WIRE_RATE) as wire:

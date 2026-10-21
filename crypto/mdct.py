@@ -19,14 +19,12 @@ class MDCTCipher(SpectralCipher):
         self,
         operation: str,
         key: bytes | None = None,
-        session_nonce: str = "mdct-live-v1",
         key_schedule: str = "per_frame",
         half_size: int = 2500,
     ):
         super().__init__(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
 
@@ -125,7 +123,7 @@ class MDCTCipher(SpectralCipher):
             return coeffs[::-1]
 
         if self.operation == "signflip":
-            rng = self._rng_for_frame("mdct-signflip")
+            rng = self._rng_for_frame()
             mask = rng.choice(
                 np.array([-1.0, 1.0]),
                 size=coeffs.shape[0],
@@ -133,7 +131,7 @@ class MDCTCipher(SpectralCipher):
             return coeffs * mask
 
         if self.operation == "shuffle":
-            rng = self._rng_for_frame("mdct-shuffle")
+            rng = self._rng_for_frame()
             perm = rng.permutation(coeffs.shape[0])
 
             if decrypt:

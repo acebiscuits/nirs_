@@ -150,28 +150,6 @@ class QIMSyncCodec:
             & 0xFFFFFFFF
         )
 
-    @staticmethod
-    def _nonce_to_bytes(
-        nonce: str,
-    ) -> bytes:
-        try:
-            raw = bytes.fromhex(
-                nonce
-            )
-
-        except ValueError as exc:
-            raise ValueError(
-                "session_nonce for QIM sync must be hex"
-            ) from exc
-
-        if len(raw) != 16:
-            raise ValueError(
-                "session_nonce must contain exactly "
-                "16 bytes / 32 hex chars"
-            )
-
-        return raw
-
     def _pack(
         self,
         info: SyncInfo,
@@ -205,17 +183,6 @@ class QIMSyncCodec:
             )
         )
 
-        if info.is_full:
-            if info.session_nonce is None:
-                raise ValueError(
-                    "full QIM sync requires session_nonce"
-                )
-
-            body.extend(
-                self._nonce_to_bytes(
-                    info.session_nonce
-                )
-            )
 
         crc = self._crc32(
             bytes(body)
@@ -284,7 +251,7 @@ class QIMSyncCodec:
             return SyncInfo(
                 next_frame_index=next_frame_index,
                 sequence=sequence,
-                session_nonce=None,
+                is_full=False,
             )
 
         if (
@@ -302,7 +269,7 @@ class QIMSyncCodec:
             return SyncInfo(
                 next_frame_index=next_frame_index,
                 sequence=sequence,
-                session_nonce=data[6:22].hex(),
+                is_full=True,
             )
 
         raise ValueError(
@@ -328,18 +295,7 @@ class QIMSyncCodec:
     def full_packet_bytes(
         self,
     ) -> int:
-        # header
-        # sequence
-        # uint32 frame
-        # nonce 16
-        # CRC32
-        return (
-            1
-            + 1
-            + 4
-            + 16
-            + 4
-        )
+        return self.periodic_packet_bytes
 
     @property
     def preamble_samples(
@@ -2272,7 +2228,7 @@ class QIMSyncStreamDecoder:
                 )
 
                 # SyncInfo MUST be delivered first.
-                # app.py will set frame index / nonce
+                # app.py will set frame index
                 # before the QIM-modified audio region
                 # enters decrypt().
                 events.append(

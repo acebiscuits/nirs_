@@ -9,7 +9,6 @@ Packet protection:
 - CRC-16 rejects corrupted metadata;
 - absolute next_frame_index allows direct resync;
 - sequence helps diagnostics/duplicate handling;
-- the full packet additionally carries the session nonce.
 
 This is a prototype physical layer. It must be tested through the actual Opus
 path before being treated as reliable. No lossy audio channel can guarantee
@@ -95,22 +94,6 @@ class AudioSyncCodec:
     def _crc16(data: bytes) -> int:
         return binascii.crc_hqx(data, 0xFFFF)
 
-    @staticmethod
-    def _nonce_to_bytes(nonce: str) -> bytes:
-        try:
-            raw = bytes.fromhex(nonce)
-        except ValueError as exc:
-            raise ValueError(
-                "session_nonce for audio sync must be a hex string"
-            ) from exc
-
-        if len(raw) != 16:
-            raise ValueError(
-                "session_nonce for audio sync must contain exactly 16 bytes "
-                "(32 hex characters)"
-            )
-        return raw
-
     def _pack(self, info: SyncInfo) -> bytes:
         if info.next_frame_index < 0 or info.next_frame_index >= 2**32:
             raise ValueError("next_frame_index must fit uint32")
@@ -121,10 +104,6 @@ class AudioSyncCodec:
         body.append(info.sequence & 0xFF)
         body.extend(info.next_frame_index.to_bytes(4, "big", signed=False))
 
-        if info.is_full:
-            if info.session_nonce is None:
-                raise ValueError("full sync requires session_nonce")
-            body.extend(self._nonce_to_bytes(info.session_nonce))
 
         crc = self._crc16(bytes(body))
         body.extend(crc.to_bytes(2, "big"))
@@ -150,18 +129,17 @@ class AudioSyncCodec:
             return SyncInfo(
                 next_frame_index=next_frame_index,
                 sequence=sequence,
-                session_nonce=None,
-                            )
+                is_full=False,
+            )
 
         if header == self.FULL_HEADER:
             if len(packet) != self.full_packet_bytes:
                 raise ValueError("invalid full sync length")
-            nonce = data[6:22].hex()
             return SyncInfo(
                 next_frame_index=next_frame_index,
                 sequence=sequence,
-                session_nonce=nonce,
-                            )
+                is_full=True,
+            )
 
         raise ValueError("unknown sync header")
 
@@ -172,8 +150,7 @@ class AudioSyncCodec:
 
     @property
     def full_packet_bytes(self) -> int:
-        # periodic fields + 16-byte session nonce
-        return 1 + 1 + 4 + 16 + 2
+        return self.periodic_packet_bytes
 
     def marker_samples_for(self, info: SyncInfo) -> int:
         packet_bytes = self.full_packet_bytes if info.is_full else self.periodic_packet_bytes

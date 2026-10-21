@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 import hashlib
 import os
-import secrets
 import socket
 import sys
 import threading
@@ -45,7 +44,7 @@ class LiveProcessor:
     """Real-time cipher + robust in-band sync.
 
     Architecture:
-      * one strong CRC32 FULL establishes nonce + absolute frame index;
+      * one strong CRC32 FULL establishes the absolute frame index;
       * after lock both sides count frames locally;
       * short periodic checkpoints carry only frame_index mod 64;
       * checkpoints are confidence/plausibility checked and a non-zero
@@ -60,8 +59,10 @@ class LiveProcessor:
         sample_rate: int,
         sync_period_seconds: float,
         full_sync_period_seconds: float,
-        full_marker_amplitude: float,
-        checkpoint_marker_amplitude: float,
+        full_preamble_amplitude: float,
+        full_symbol_amplitude: float,
+        checkpoint_preamble_amplitude: float,
+        checkpoint_symbol_amplitude: float,
         full_audio_gain: float,
         checkpoint_audio_gain: float,
         full_preamble_ms: float,
@@ -83,8 +84,6 @@ class LiveProcessor:
         checkpoint_large_drift_min_confidence: float,
         rx_sync_mute: str,
         rx_sync_lookahead_ms: float,
-        rx_full_mute_threshold: float,
-        rx_checkpoint_mute_threshold: float,
         rx_sync_mute_fade_ms: float,
     ):
         if not (0.0 < ciphertext_gain <= 1.0):
@@ -121,10 +120,6 @@ class LiveProcessor:
             raise ValueError("rx_sync_mute must be off, checkpoint or all")
         if rx_sync_lookahead_ms < 0.0:
             raise ValueError("rx_sync_lookahead_ms must be >= 0")
-        if not (0.0 <= rx_full_mute_threshold <= 1.0):
-            raise ValueError("rx_full_mute_threshold must be in [0, 1]")
-        if not (0.0 <= rx_checkpoint_mute_threshold <= 1.0):
-            raise ValueError("rx_checkpoint_mute_threshold must be in [0, 1]")
         if rx_sync_mute_fade_ms < 0.0:
             raise ValueError("rx_sync_mute_fade_ms must be >= 0")
 
@@ -134,8 +129,6 @@ class LiveProcessor:
         self.rx_sync_lookahead_samples = int(
             round(self.sample_rate * float(rx_sync_lookahead_ms) / 1000.0)
         )
-        self.rx_full_mute_threshold = float(rx_full_mute_threshold)
-        self.rx_checkpoint_mute_threshold = float(rx_checkpoint_mute_threshold)
         self.rx_sync_mute_fade_samples = int(
             round(self.sample_rate * float(rx_sync_mute_fade_ms) / 1000.0)
         )
@@ -153,8 +146,10 @@ class LiveProcessor:
 
         self.sync_codec = RobustSyncCodec(
             sample_rate=sample_rate,
-            full_marker_amplitude=full_marker_amplitude,
-            checkpoint_marker_amplitude=checkpoint_marker_amplitude,
+            full_preamble_amplitude=full_preamble_amplitude,
+            full_symbol_amplitude=full_symbol_amplitude,
+            checkpoint_preamble_amplitude=checkpoint_preamble_amplitude,
+            checkpoint_symbol_amplitude=checkpoint_symbol_amplitude,
             full_preamble_ms=full_preamble_ms,
             full_symbol_ms=full_symbol_ms,
             checkpoint_preamble_ms=checkpoint_preamble_ms,
@@ -576,18 +571,12 @@ class LiveProcessor:
 
     def _handle_full(self, info: SyncInfo, preamble_score: float) -> None:
         local_before = int(self.rx_cipher.frame_index)
-        is_new_session = (
-            self.rx_locked
-            and info.session_nonce != self.rx_cipher.session_nonce
-        )
 
-        if not self.rx_locked or is_new_session:
+        if not self.rx_locked:
             self.rx_sync.apply_sync(self.rx_cipher, info, hard=True)
             self.rx_locked = True
-            action = "HARD_LOCK" if not is_new_session else "HARD_NEW_SESSION"
+            action = "HARD_LOCK"
         else:
-            # Same nonce + CRC32-valid absolute checkpoint: preserve overlap
-            # state and only re-anchor the frame counter at marker END.
             self.rx_sync.apply_sync(self.rx_cipher, info, hard=False)
             action = "ABS_REANCHOR"
 
@@ -861,13 +850,9 @@ class LiveProcessor:
         if self.rx_sync_mute == "off":
             return False
         if window.kind == "checkpoint":
-            if self.rx_sync_mute not in {"checkpoint", "all"}:
-                return False
-            return window.preamble_score >= self.rx_checkpoint_mute_threshold
+            return self.rx_sync_mute in {"checkpoint", "all"}
         if window.kind == "full":
-            if self.rx_sync_mute != "all":
-                return False
-            return window.preamble_score >= self.rx_full_mute_threshold
+            return self.rx_sync_mute == "all"
         return False
 
     def _add_mute_window(self, window: DetectedMarkerWindow) -> None:
@@ -1067,21 +1052,18 @@ def build_cipher(
     transform: str,
     operation: str,
     key: bytes,
-    session_nonce: str,
     key_schedule: str,
 ):
     if transform == "stft":
         return STFTCipher(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     if transform == "mdct":
         return MDCTCipher(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     raise ValueError(f"unknown transform: {transform}")
@@ -1108,24 +1090,16 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="rare CRC32 absolute re-anchor interval",
     )
-    parser.add_argument(
-        "--full-marker-amplitude",
-        type=float,
-        default=0.30,
-        help="FULL modem base amplitude",
-    )
-    parser.add_argument(
-        "--checkpoint-marker-amplitude",
-        type=float,
-        default=0.30,
-        help="checkpoint modem base amplitude; historical 0.80/0.72 internal ratios remain",
-    )
+    parser.add_argument("--full-preamble-amplitude", type=float, default=0.30)
+    parser.add_argument("--full-symbol-amplitude", type=float, default=0.16)
+    parser.add_argument("--checkpoint-preamble-amplitude", type=float, default=0.30)
+    parser.add_argument("--checkpoint-symbol-amplitude", type=float, default=0.14)
     parser.add_argument("--full-audio-gain", type=float, default=0.58)
     parser.add_argument("--checkpoint-audio-gain", type=float, default=0.82)
     parser.add_argument("--full-preamble-ms", type=float, default=60.0)
     parser.add_argument("--full-symbol-ms", type=float, default=8.0)
     parser.add_argument("--checkpoint-preamble-ms", type=float, default=16.0)
-    parser.add_argument("--checkpoint-symbol-ms", type=float, default=5.0)
+    parser.add_argument("--checkpoint-symbol-ms", type=float, default=4.0)
     parser.add_argument("--full-detection-threshold", type=float, default=0.50)
     parser.add_argument("--checkpoint-detection-threshold", type=float, default=0.48)
     parser.add_argument("--ciphertext-gain", type=float, default=0.68)
@@ -1182,18 +1156,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=100.0,
         help="fixed RX look-ahead used to mute a marker from its beginning",
-    )
-    parser.add_argument(
-        "--rx-full-mute-threshold",
-        type=float,
-        default=0.70,
-        help="minimum FULL preamble score before local speaker muting",
-    )
-    parser.add_argument(
-        "--rx-checkpoint-mute-threshold",
-        type=float,
-        default=0.50,
-        help="minimum checkpoint preamble score before local speaker muting",
     )
     parser.add_argument(
         "--rx-sync-mute-fade-ms",
@@ -1307,21 +1269,17 @@ def run(args: argparse.Namespace) -> None:
     print("Key path          :", key_path.resolve())
     print("Key SHA256 prefix :", hashlib.sha256(key).hexdigest()[:16])
 
-    tx_nonce = secrets.token_hex(16)
-    rx_placeholder_nonce = "00" * 16
 
     tx_cipher = build_cipher(
         args.transform,
         args.operation,
         key,
-        tx_nonce,
         args.key_schedule,
     )
     rx_cipher = build_cipher(
         args.transform,
         args.operation,
         key,
-        rx_placeholder_nonce,
         args.key_schedule,
     )
 
@@ -1331,8 +1289,10 @@ def run(args: argparse.Namespace) -> None:
         sample_rate=RATE,
         sync_period_seconds=args.sync_period,
         full_sync_period_seconds=args.full_sync_period,
-        full_marker_amplitude=args.full_marker_amplitude,
-        checkpoint_marker_amplitude=args.checkpoint_marker_amplitude,
+        full_preamble_amplitude=args.full_preamble_amplitude,
+        full_symbol_amplitude=args.full_symbol_amplitude,
+        checkpoint_preamble_amplitude=args.checkpoint_preamble_amplitude,
+        checkpoint_symbol_amplitude=args.checkpoint_symbol_amplitude,
         full_audio_gain=args.full_audio_gain,
         checkpoint_audio_gain=args.checkpoint_audio_gain,
         full_preamble_ms=args.full_preamble_ms,
@@ -1354,8 +1314,6 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_large_drift_min_confidence=args.checkpoint_large_drift_min_confidence,
         rx_sync_mute=args.rx_sync_mute,
         rx_sync_lookahead_ms=args.rx_sync_lookahead_ms,
-        rx_full_mute_threshold=args.rx_full_mute_threshold,
-        rx_checkpoint_mute_threshold=args.rx_checkpoint_mute_threshold,
         rx_sync_mute_fade_ms=args.rx_sync_mute_fade_ms,
     )
 
@@ -1372,8 +1330,10 @@ def run(args: argparse.Namespace) -> None:
     print("Sync                : robust chirp + DTMF-like modem")
     print("Sync period         :", args.sync_period, "s")
     print("Full refresh period :", args.full_sync_period, "s")
-    print("FULL base amplitude :", args.full_marker_amplitude)
-    print("CP base amplitude   :", args.checkpoint_marker_amplitude)
+    print("FULL preamble amp   :", args.full_preamble_amplitude)
+    print("FULL symbol amp     :", args.full_symbol_amplitude)
+    print("CP preamble amp     :", args.checkpoint_preamble_amplitude)
+    print("CP symbol amp       :", args.checkpoint_symbol_amplitude)
     print("FULL audio gain     :", args.full_audio_gain)
     print("CP audio gain       :", args.checkpoint_audio_gain)
     print("RX sync mute        :", args.rx_sync_mute)
