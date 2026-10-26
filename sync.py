@@ -5,12 +5,20 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SyncInfo:
+    """Absolute frame marker. Type comes from chirp (not a nonce field)."""
     next_frame_index: int
     sequence: int = 0
     is_full: bool = True
 
 
 class FrameSynchronizer:
+    """Pure synchronization logic.
+
+    This class decides WHEN a marker is needed and WHAT metadata it contains.
+    It does not generate audio. audio_sync.py is responsible for turning
+    SyncInfo into PCM and detecting it on RX.
+    """
+
     def __init__(
         self,
         sample_rate: int,
@@ -36,10 +44,18 @@ class FrameSynchronizer:
         return max(1, round(seconds * sample_rate / cipher.hop_size))
 
     def periodic_interval_frames(self, cipher) -> int:
-        return self._frames_for_period(cipher, self.sample_rate, self.sync_period_seconds)
+        return self._frames_for_period(
+            cipher,
+            self.sample_rate,
+            self.sync_period_seconds,
+        )
 
     def full_interval_frames(self, cipher) -> int:
-        return self._frames_for_period(cipher, self.sample_rate, self.full_sync_period_seconds)
+        return self._frames_for_period(
+            cipher,
+            self.sample_rate,
+            self.full_sync_period_seconds,
+        )
 
     def _next_sequence(self) -> int:
         value = self._sequence
@@ -47,6 +63,11 @@ class FrameSynchronizer:
         return value
 
     def should_schedule_periodic(self, cipher, next_frame_index: int) -> bool:
+        """Called after a frame has finished.
+
+        If True, the marker must start on the NEXT output hop. Therefore the
+        packet carries next_frame_index, not the frame that just finished.
+        """
         if next_frame_index <= 0:
             return False
         return next_frame_index % self.periodic_interval_frames(cipher) == 0
@@ -59,6 +80,7 @@ class FrameSynchronizer:
     def make_full_sync(self, cipher, next_frame_index: int | None = None) -> SyncInfo:
         if next_frame_index is None:
             next_frame_index = cipher.frame_index
+
         return SyncInfo(
             next_frame_index=next_frame_index,
             sequence=self._next_sequence(),
@@ -74,6 +96,14 @@ class FrameSynchronizer:
 
     @staticmethod
     def apply_sync(cipher, sync: SyncInfo, hard: bool = False) -> None:
+        """Apply a received sync packet.
+
+        Normal periodic resync is SOFT: only the frame number is corrected and
+        STFT/MDCT overlap buffers are preserved.
+
+        hard=True is for initial lock or a real stream restart. It clears the
+        transform streaming state and therefore may create a short transient.
+        """
         if sync.next_frame_index < 0:
             raise ValueError("sync next_frame_index must be >= 0")
 

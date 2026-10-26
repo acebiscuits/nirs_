@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import select
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,7 @@ class LiveProcessor:
     """Real-time cipher + robust in-band sync.
 
     Architecture:
-      * one strong CRC32 FULL establishes the absolute frame index;
+      * one strong CRC32 FULL establishes nonce + absolute frame index;
       * after lock both sides count frames locally;
       * short periodic checkpoints carry only frame_index mod 64;
       * checkpoints are confidence/plausibility checked and a non-zero
@@ -59,6 +60,8 @@ class LiveProcessor:
         sample_rate: int,
         sync_period_seconds: float,
         full_sync_period_seconds: float,
+        full_marker_amplitude: float,
+        checkpoint_marker_amplitude: float,
         full_preamble_amplitude: float,
         full_symbol_amplitude: float,
         checkpoint_preamble_amplitude: float,
@@ -84,7 +87,11 @@ class LiveProcessor:
         checkpoint_large_drift_min_confidence: float,
         rx_sync_mute: str,
         rx_sync_lookahead_ms: float,
+        rx_full_mute_threshold: float,
+        rx_checkpoint_mute_threshold: float,
         rx_sync_mute_fade_ms: float,
+        rx_mode: str = "correct",
+        wrong_key: bytes | None = None,
     ):
         if not (0.0 < ciphertext_gain <= 1.0):
             raise ValueError("ciphertext_gain must be in (0, 1]")
@@ -107,6 +114,16 @@ class LiveProcessor:
 
         self.tx_cipher = tx_cipher
         self.rx_cipher = rx_cipher
+        # One decryptor, two test keys. Switching keys at the spectral frame
+        # boundary preserves its stream buffers and counter without running a
+        # second expensive MDCT/STFT decryptor in parallel.
+        self._rx_correct_key = rx_cipher.key
+        self._rx_wrong_key = wrong_key or hashlib.sha256(b"WRONG-RX-TEST:" + self._rx_correct_key).digest()
+        if rx_mode not in {"raw", "correct", "wrong"}:
+            raise ValueError("rx_mode must be raw/correct/wrong")
+        self.rx_mode = rx_mode
+        self._rx_mode_lock = threading.Lock()
+        self._last_unlocked_log = 0.0
         self.sample_rate = int(sample_rate)
         self.node_name = node_name
         self.ciphertext_gain = float(ciphertext_gain)
@@ -120,6 +137,10 @@ class LiveProcessor:
             raise ValueError("rx_sync_mute must be off, checkpoint or all")
         if rx_sync_lookahead_ms < 0.0:
             raise ValueError("rx_sync_lookahead_ms must be >= 0")
+        if not (0.0 <= rx_full_mute_threshold <= 1.0):
+            raise ValueError("rx_full_mute_threshold must be in [0, 1]")
+        if not (0.0 <= rx_checkpoint_mute_threshold <= 1.0):
+            raise ValueError("rx_checkpoint_mute_threshold must be in [0, 1]")
         if rx_sync_mute_fade_ms < 0.0:
             raise ValueError("rx_sync_mute_fade_ms must be >= 0")
 
@@ -129,6 +150,8 @@ class LiveProcessor:
         self.rx_sync_lookahead_samples = int(
             round(self.sample_rate * float(rx_sync_lookahead_ms) / 1000.0)
         )
+        self.rx_full_mute_threshold = float(rx_full_mute_threshold)
+        self.rx_checkpoint_mute_threshold = float(rx_checkpoint_mute_threshold)
         self.rx_sync_mute_fade_samples = int(
             round(self.sample_rate * float(rx_sync_mute_fade_ms) / 1000.0)
         )
@@ -146,6 +169,8 @@ class LiveProcessor:
 
         self.sync_codec = RobustSyncCodec(
             sample_rate=sample_rate,
+            full_marker_amplitude=full_marker_amplitude,
+            checkpoint_marker_amplitude=checkpoint_marker_amplitude,
             full_preamble_amplitude=full_preamble_amplitude,
             full_symbol_amplitude=full_symbol_amplitude,
             checkpoint_preamble_amplitude=checkpoint_preamble_amplitude,
@@ -194,6 +219,13 @@ class LiveProcessor:
 
         self._last_checkpoint_scheduled_frame = 0
         self._last_full_scheduled_frame = 0
+        # Don't flood the voice channel with 200ms FULL packets on every
+        # tiny capture gap. This happened dozens of times in the MDCT logs.
+        self._gap_full_pending = False
+        self._last_gap_full_frame = -(2 * self.sample_rate // self.hop_size)
+        self._gap_full_cooldown_frames = max(
+            1, (2 * self.sample_rate + self.hop_size - 1) // self.hop_size
+        )
 
         if sync_diag_interval <= 0:
             raise ValueError("sync_diag_interval must be > 0")
@@ -223,6 +255,25 @@ class LiveProcessor:
         self._rx_hold = np.empty(0, dtype=np.float64)
         self._rx_pending_events: list[DetectedSyncEvent] = []
         self._rx_mute_intervals: list[tuple[int, int, str, float]] = []
+
+    def get_rx_mode(self) -> str:
+        with self._rx_mode_lock:
+            return self.rx_mode
+
+    def set_rx_mode(self, mode: str) -> None:
+        if mode not in {"raw", "correct", "wrong"}:
+            raise ValueError("mode must be raw/correct/wrong")
+        with self._rx_mode_lock:
+            old = self.rx_mode
+            self.rx_mode = mode
+        self._log(
+            "RX<-REMOTE", "MODE CHANGE",
+            old=old, new=mode.upper(), locked=self.rx_locked,
+            frame=self.rx_cipher.frame_index,
+            reason=("RAW=received ciphertext" if mode == "raw" else
+                    "CORRECT=real key; silence until FULL" if mode == "correct" else
+                    "WRONG=deliberately wrong key; silence until FULL"),
+        )
 
     def _log(self, direction: str, event: str, **fields) -> None:
         ts = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
@@ -348,6 +399,14 @@ class LiveProcessor:
 
         next_index = int(self.tx_cipher.frame_index)
 
+        if self._gap_full_pending:
+            if next_index - self._last_gap_full_frame >= self._gap_full_cooldown_frames:
+                self._queue_full(next_index)
+                self._last_gap_full_frame = next_index
+                self._gap_full_pending = False
+            # Do not emit checkpoints while an emergency FULL is waiting.
+            return
+
         # Acquisition first: send the configured number of strong FULL markers
         # consecutively. They are expensive but only happen at startup.
         if self.initial_full_remaining > 0:
@@ -440,7 +499,9 @@ class LiveProcessor:
         self.active_marker = np.empty(0, dtype=np.float64)
         self.active_marker_pos = 0
         self.active_marker_kind = None
-        self._queue_full(after)
+        # Schedule at most one recovery FULL per two seconds, instead of one
+        # for every dropped BLOCK (which rendered speech unusable in MDCT).
+        self._gap_full_pending = True
 
         self._log(
             "TX->REMOTE",
@@ -448,21 +509,15 @@ class LiveProcessor:
             dropped_blocks=dropped_blocks,
             frame_before=before,
             frame_after=after,
-            action="ZERO_ADVANCE_AND_FULL",
+            action="ZERO_ADVANCE_FULL_PENDING_RATE_LIMITED",
         )
 
     def on_rx_gap(self, dropped_blocks: int, block_samples: int) -> None:
-        """Advance RX over discarded real-time PCM without desynchronizing cursors.
+        """Advance RX over dropped stale PCM instead of building latency.
 
-        The sync decoder and the speaker look-ahead use the same absolute sample
-        timeline.  When AudioBridge drops queued blocks, BOTH timelines must jump
-        by exactly the discarded sample count.  Older versions advanced only the
-        decoder cursor; after the first RX drop every later mute window was shifted
-        and modem chirps leaked to the speakers even though SYNC MUTE was logged.
-
-        Audio already sitting in the short look-ahead buffer has been seen by the
-        detector but not yet by the decryptor.  Consume it for cipher/event state
-        and discard its playback before jumping over the actually missing blocks.
+        Missing ciphertext is represented by zero PCM solely to advance streaming
+        state/frame counters. Output for the gap is discarded. Detector history is
+        reset so no preamble can straddle the discontinuity.
         """
         dropped_blocks = max(0, int(dropped_blocks))
         block_samples = max(1, int(block_samples))
@@ -470,28 +525,7 @@ class LiveProcessor:
             return
 
         skipped_samples = dropped_blocks * block_samples
-
-        # Bring decrypt/event state up to the end of audio that was already fed to
-        # the detector but was still waiting in the speaker look-ahead.  Its output
-        # is intentionally discarded: after a real-time drop we prefer the live edge.
-        held_samples = int(self._rx_hold.size)
-        if held_samples > 0:
-            self._process_released_audio(
-                self._rx_hold.copy(),
-                int(self._rx_hold_start_abs),
-            )
-            self._rx_hold = np.empty(0, dtype=np.float64)
-            self._rx_hold_start_abs = int(self._rx_input_total_abs)
-
-        # A discontinuity invalidates candidate windows/events that straddle it.
-        self._rx_pending_events.clear()
-        self._rx_mute_intervals.clear()
-
-        # Keep detector absolute coordinates and LiveProcessor playback coordinates
-        # on the SAME timeline.  This is essential for marker suppression.
         self.sync_decoder.skip_samples(skipped_samples)
-        self._rx_input_total_abs += skipped_samples
-        self._rx_hold_start_abs = int(self._rx_input_total_abs)
 
         before = int(self.rx_cipher.frame_index)
         if self.rx_locked:
@@ -502,14 +536,10 @@ class LiveProcessor:
 
         self._pending_checkpoint_drift = None
         self._pending_checkpoint_count = 0
-        self._large_drift_estimate = None
-        self._large_drift_count = 0
         self._log(
             "RX<-REMOTE",
             "REALTIME GAP",
             dropped_blocks=dropped_blocks,
-            skipped_samples=skipped_samples,
-            discarded_lookahead_samples=held_samples,
             frame_before=before,
             frame_after=after,
             locked=self.rx_locked,
@@ -571,12 +601,13 @@ class LiveProcessor:
 
     def _handle_full(self, info: SyncInfo, preamble_score: float) -> None:
         local_before = int(self.rx_cipher.frame_index)
-
         if not self.rx_locked:
             self.rx_sync.apply_sync(self.rx_cipher, info, hard=True)
             self.rx_locked = True
             action = "HARD_LOCK"
         else:
+            # Same nonce + CRC32-valid absolute checkpoint: preserve overlap
+            # state and only re-anchor the frame counter at marker END.
             self.rx_sync.apply_sync(self.rx_cipher, info, hard=False)
             action = "ABS_REANCHOR"
 
@@ -613,10 +644,10 @@ class LiveProcessor:
         drift = int(resolved - local)
 
         if cp.confidence < self.checkpoint_min_confidence:
-            # A weak observation carries no evidence either way.  Ignore it
-            # instead of erasing a good 1/2 or 2/3 hypothesis accumulated from
-            # previous strong checkpoints.  A later contradictory *strong*
-            # checkpoint will replace the hypothesis normally.
+            self._pending_checkpoint_drift = None
+            self._pending_checkpoint_count = 0
+            self._large_drift_estimate = None
+            self._large_drift_count = 0
             self._log(
                 "RX<-REMOTE",
                 "CHECKPOINT REJECT",
@@ -653,8 +684,10 @@ class LiveProcessor:
             # is never auto-applied.
             ambiguous_limit = cp.modulus // 2
             if abs(drift) >= ambiguous_limit:
-                # This observation is unusable because modulo-N cannot choose a
-                # direction, but it also does not disprove an existing hypothesis.
+                self._pending_checkpoint_drift = None
+                self._pending_checkpoint_count = 0
+                self._large_drift_estimate = None
+                self._large_drift_count = 0
                 self._log(
                     "RX<-REMOTE",
                     "CHECKPOINT REJECT",
@@ -669,9 +702,10 @@ class LiveProcessor:
                 return
 
             if cp.confidence < self.checkpoint_large_drift_min_confidence:
-                # Same rule as above: a weak large-drift decode is simply ignored.
-                # Do not destroy a stable hypothesis because one checkpoint was
-                # mangled by WebRTC.
+                self._pending_checkpoint_drift = None
+                self._pending_checkpoint_count = 0
+                self._large_drift_estimate = None
+                self._large_drift_count = 0
                 self._log(
                     "RX<-REMOTE",
                     "CHECKPOINT REJECT",
@@ -784,21 +818,44 @@ class LiveProcessor:
         else:
             self._handle_checkpoint(event.payload, event.preamble_score)
 
-    def _decrypt_segment(self, segment: np.ndarray, output_parts: list[np.ndarray]) -> None:
+    def _decrypt_segment(
+        self,
+        segment: np.ndarray,
+        output_parts: list[np.ndarray],
+        raw_unmodified: np.ndarray | None = None,
+    ) -> None:
         if segment.size == 0:
             return
 
-        # Before initial FULL lock, never mute RX. Pass the received audio
-        # through unchanged so the Pulse/WebRTC path stays audible and can be
-        # diagnosed by ear. As soon as FULL is accepted, switch to normal
-        # decrypt mode at that exact stream position.
+        # RAW is the actual incoming PCM before any marker suppression.
+        raw_listen = segment if raw_unmodified is None else raw_unmodified
+        mode = self.get_rx_mode()
         if not self.rx_locked:
-            output_parts.append(segment.copy())
+            # CRITICAL: previous build silently passed ciphertext unchanged in
+            # CORRECT mode. That made an unencrypted/bypassed browser route look
+            # like successful decryption. Fail closed instead.
+            if mode == "raw":
+                output_parts.append(raw_listen.copy())
+            else:
+                output_parts.append(np.zeros_like(segment))
             return
 
+        # Even in RAW we must advance the same live cipher so switching back to
+        # CORRECT does not leave frame_index and overlap state behind.
         ciphertext = segment / self.ciphertext_gain
-        restored = self.rx_cipher.decrypt(ciphertext)
-        if restored.size:
+        # Use a different key ONLY while calculating one selected WRONG
+        # segment. Restore the key in all cases; no second expensive cipher.
+        self.rx_cipher.key = self._rx_wrong_key if mode == "wrong" else self._rx_correct_key
+        try:
+            restored = self.rx_cipher.decrypt(ciphertext)
+        finally:
+            self.rx_cipher.key = self._rx_correct_key
+
+        if mode == "raw":
+            # Raw received PCM BEFORE optional sync-mute, no decrypt or gain
+            # compensation. Decoder state was still advanced above.
+            output_parts.append(raw_listen.copy())
+        elif restored.size:
             output_parts.append(restored)
 
     def _maybe_log_sync_diagnostics(self) -> None:
@@ -826,6 +883,7 @@ class LiveProcessor:
             total_cp_ok=stats["total_checkpoint_ok"],
             buffered=stats["buffered_samples"],
             locked=self.rx_locked,
+            rx_mode=self.get_rx_mode().upper(),
             frame=self.rx_cipher.frame_index,
             pending_drift=(
                 "none"
@@ -850,9 +908,13 @@ class LiveProcessor:
         if self.rx_sync_mute == "off":
             return False
         if window.kind == "checkpoint":
-            return self.rx_sync_mute in {"checkpoint", "all"}
+            if self.rx_sync_mute not in {"checkpoint", "all"}:
+                return False
+            return window.preamble_score >= self.rx_checkpoint_mute_threshold
         if window.kind == "full":
-            return self.rx_sync_mute == "all"
+            if self.rx_sync_mute != "all":
+                return False
+            return window.preamble_score >= self.rx_full_mute_threshold
         return False
 
     def _add_mute_window(self, window: DetectedMarkerWindow) -> None:
@@ -963,16 +1025,18 @@ class LiveProcessor:
             if event_end > cursor_abs:
                 i0 = cursor_abs - raw_start_abs
                 i1 = event_end - raw_start_abs
-                piece = self._mask_sync_audio(raw[i0:i1], cursor_abs)
-                self._decrypt_segment(piece, output_parts)
+                unmodified = raw[i0:i1]
+                piece = self._mask_sync_audio(unmodified, cursor_abs)
+                self._decrypt_segment(piece, output_parts, raw_unmodified=unmodified)
 
             self._handle_detected_event(event)
             cursor_abs = event_end
 
         if cursor_abs < raw_end_abs:
             i0 = cursor_abs - raw_start_abs
-            piece = self._mask_sync_audio(raw[i0:], cursor_abs)
-            self._decrypt_segment(piece, output_parts)
+            unmodified = raw[i0:]
+            piece = self._mask_sync_audio(unmodified, cursor_abs)
+            self._decrypt_segment(piece, output_parts, raw_unmodified=unmodified)
 
         if not output_parts:
             return b""
@@ -1052,18 +1116,21 @@ def build_cipher(
     transform: str,
     operation: str,
     key: bytes,
+    session_nonce: str,
     key_schedule: str,
 ):
     if transform == "stft":
         return STFTCipher(
             operation=operation,
             key=key,
+            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     if transform == "mdct":
         return MDCTCipher(
             operation=operation,
             key=key,
+            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     raise ValueError(f"unknown transform: {transform}")
@@ -1083,6 +1150,10 @@ def parse_args() -> argparse.Namespace:
         default="per_frame",
     )
     parser.add_argument("--key", default="key.bin")
+    parser.add_argument(
+        "--rx-mode", choices=["raw", "correct", "wrong"], default="correct",
+        help="initial RX listening mode; change live with 1/2/3 then ENTER",
+    )
     parser.add_argument("--sync-period", type=float, default=0.5)
     parser.add_argument(
         "--full-sync-period",
@@ -1090,12 +1161,24 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="rare CRC32 absolute re-anchor interval",
     )
+    parser.add_argument(
+        "--full-marker-amplitude",
+        type=float,
+        default=0.30,
+        help="FULL modem base amplitude",
+    )
+    parser.add_argument(
+        "--checkpoint-marker-amplitude",
+        type=float,
+        default=0.30,
+        help="checkpoint modem base amplitude; historical 0.80/0.72 internal ratios remain",
+    )
     parser.add_argument("--full-preamble-amplitude", type=float, default=0.30)
     parser.add_argument("--full-symbol-amplitude", type=float, default=0.16)
     parser.add_argument("--checkpoint-preamble-amplitude", type=float, default=0.30)
     parser.add_argument("--checkpoint-symbol-amplitude", type=float, default=0.14)
     parser.add_argument("--full-audio-gain", type=float, default=0.58)
-    parser.add_argument("--checkpoint-audio-gain", type=float, default=0.82)
+    parser.add_argument("--checkpoint-audio-gain", type=float, default=0.67)
     parser.add_argument("--full-preamble-ms", type=float, default=60.0)
     parser.add_argument("--full-symbol-ms", type=float, default=8.0)
     parser.add_argument("--checkpoint-preamble-ms", type=float, default=16.0)
@@ -1156,6 +1239,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=100.0,
         help="fixed RX look-ahead used to mute a marker from its beginning",
+    )
+    parser.add_argument(
+        "--rx-full-mute-threshold",
+        type=float,
+        default=0.50,
+        help="minimum FULL preamble score before local speaker muting",
+    )
+    parser.add_argument(
+        "--rx-checkpoint-mute-threshold",
+        type=float,
+        default=0.50,
+        help="minimum checkpoint preamble score before local speaker muting",
     )
     parser.add_argument(
         "--rx-sync-mute-fade-ms",
@@ -1269,17 +1364,22 @@ def run(args: argparse.Namespace) -> None:
     print("Key path          :", key_path.resolve())
     print("Key SHA256 prefix :", hashlib.sha256(key).hexdigest()[:16])
 
+    # No session nonce on wire; both ciphers use the same frame-based key seed.
+    tx_nonce = ""
+    rx_placeholder_nonce = ""
 
     tx_cipher = build_cipher(
         args.transform,
         args.operation,
         key,
+        tx_nonce,
         args.key_schedule,
     )
     rx_cipher = build_cipher(
         args.transform,
         args.operation,
         key,
+        rx_placeholder_nonce,
         args.key_schedule,
     )
 
@@ -1289,6 +1389,8 @@ def run(args: argparse.Namespace) -> None:
         sample_rate=RATE,
         sync_period_seconds=args.sync_period,
         full_sync_period_seconds=args.full_sync_period,
+        full_marker_amplitude=args.full_marker_amplitude,
+        checkpoint_marker_amplitude=args.checkpoint_marker_amplitude,
         full_preamble_amplitude=args.full_preamble_amplitude,
         full_symbol_amplitude=args.full_symbol_amplitude,
         checkpoint_preamble_amplitude=args.checkpoint_preamble_amplitude,
@@ -1314,7 +1416,11 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_large_drift_min_confidence=args.checkpoint_large_drift_min_confidence,
         rx_sync_mute=args.rx_sync_mute,
         rx_sync_lookahead_ms=args.rx_sync_lookahead_ms,
+        rx_full_mute_threshold=args.rx_full_mute_threshold,
+        rx_checkpoint_mute_threshold=args.rx_checkpoint_mute_threshold,
         rx_sync_mute_fade_ms=args.rx_sync_mute_fade_ms,
+        rx_mode=args.rx_mode,
+        wrong_key=hashlib.sha256(b"WRONG-RX-TEST:" + key).digest(),
     )
 
     virtual_devices = PulseVirtualDevices()
@@ -1328,6 +1434,11 @@ def run(args: argparse.Namespace) -> None:
     print("Operation           :", args.operation)
     print("Key schedule        :", args.key_schedule)
     print("Sync                : robust chirp + DTMF-like modem")
+    print("RX MODE             :", processor.get_rx_mode().upper())
+    print("RX fail-closed      : yes (CORRECT/WRONG silent until FULL)")
+    print("WRONG test          : uses deliberately different key")
+    if args.operation == "invert":
+        print("WARNING: --operation invert is not keyed; WRONG cannot differ from CORRECT.")
     print("Sync period         :", args.sync_period, "s")
     print("Full refresh period :", args.full_sync_period, "s")
     print("FULL preamble amp   :", args.full_preamble_amplitude)
@@ -1366,10 +1477,48 @@ def run(args: argparse.Namespace) -> None:
         print("Messenger settings:")
         print("  Microphone = TX_Microphone")
         print("  Speakers   = RX_sink")
-        print("Ctrl+C = stop")
+        print("RX LISTENING MODES (enter digit and press ENTER):", flush=True)
+        print("  1 = RAW      : received ciphertext, no decryption", flush=True)
+        print("  2 = CORRECT  : correct key, only AFTER CRC32-verified FULL", flush=True)
+        print("  3 = WRONG    : deliberately wrong key, only AFTER FULL", flush=True)
+        print("  ENTER = show state   |   q = stop   |   Ctrl+C = stop", flush=True)
+        print("ACTIVE RX MODE:", processor.get_rx_mode().upper(), flush=True)
 
-        while not stop_event.wait(0.5):
-            pass
+        # Keep UI input out of the real-time TX/RX worker threads. A changed
+        # mode takes effect at the next processed RX segment.
+        while not stop_event.is_set():
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+            except (OSError, ValueError):
+                # Non-interactive invocation without attached stdin.
+                stop_event.wait(0.25)
+                continue
+            if not ready:
+                continue
+            line = sys.stdin.readline()
+            if line == "":
+                # EOF: keep running until Ctrl+C rather than spinning.
+                stop_event.wait(0.25)
+                continue
+            cmd = line.strip().lower()
+            if cmd in {"1", "2", "3"}:
+                processor.set_rx_mode({"1": "raw", "2": "correct", "3": "wrong"}[cmd])
+            elif cmd in {"q", "quit", "exit"}:
+                print("Stopping by console command...", flush=True)
+                stop_event.set()
+            elif cmd == "":
+                print(
+                    "RX STATUS: mode=%s locked=%s frame=%d full_ok=%d cp_ok=%d"
+                    % (
+                        processor.get_rx_mode().upper(),
+                        processor.rx_locked,
+                        processor.rx_cipher.frame_index,
+                        getattr(processor.sync_decoder, "total_full_ok", -1),
+                        getattr(processor.sync_decoder, "total_checkpoint_ok", -1),
+                    ), flush=True,
+                )
+            else:
+                print("Unknown command. Use 1 / 2 / 3 / ENTER / q", flush=True)
     finally:
         if bridge is not None:
             bridge.stop()
