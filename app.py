@@ -1116,21 +1116,22 @@ def build_cipher(
     transform: str,
     operation: str,
     key: bytes,
-    session_nonce: str,
     key_schedule: str,
 ):
+    """Create cipher without legacy session_nonce, which is no longer on wire.
+
+    Compatible with both current and older STFTCipher/MDCTCipher signatures.
+    """
     if transform == "stft":
         return STFTCipher(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     if transform == "mdct":
         return MDCTCipher(
             operation=operation,
             key=key,
-            session_nonce=session_nonce,
             key_schedule=key_schedule,
         )
     raise ValueError(f"unknown transform: {transform}")
@@ -1364,23 +1365,12 @@ def run(args: argparse.Namespace) -> None:
     print("Key path          :", key_path.resolve())
     print("Key SHA256 prefix :", hashlib.sha256(key).hexdigest()[:16])
 
-    # No session nonce on wire; both ciphers use the same frame-based key seed.
-    tx_nonce = ""
-    rx_placeholder_nonce = ""
-
+    # Full sync now carries only next_frame_index and CRC32; no session_nonce.
     tx_cipher = build_cipher(
-        args.transform,
-        args.operation,
-        key,
-        tx_nonce,
-        args.key_schedule,
+        args.transform, args.operation, key, args.key_schedule,
     )
     rx_cipher = build_cipher(
-        args.transform,
-        args.operation,
-        key,
-        rx_placeholder_nonce,
-        args.key_schedule,
+        args.transform, args.operation, key, args.key_schedule,
     )
 
     processor = LiveProcessor(
