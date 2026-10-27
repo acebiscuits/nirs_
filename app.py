@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import hashlib
+import zlib
 import os
 import socket
 import sys
@@ -119,8 +120,8 @@ class LiveProcessor:
         # second expensive MDCT/STFT decryptor in parallel.
         self._rx_correct_key = rx_cipher.key
         self._rx_wrong_key = wrong_key or hashlib.sha256(b"WRONG-RX-TEST:" + self._rx_correct_key).digest()
-        if rx_mode not in {"raw", "correct", "wrong"}:
-            raise ValueError("rx_mode must be raw/correct/wrong")
+        if rx_mode not in {"mute", "raw", "correct", "wrong"}:
+            raise ValueError("rx_mode must be mute/raw/correct/wrong")
         self.rx_mode = rx_mode
         self._rx_mode_lock = threading.Lock()
         self._last_unlocked_log = 0.0
@@ -246,6 +247,20 @@ class LiveProcessor:
         self._rx_process_max_ms = 0.0
         self._rx_process_calls = 0
 
+        # Independent proof of the audio path: counters reflect bytes delivered
+        # to the physical-speaker pacat process, not what a browser UI claims.
+        self._rx_meter_mode = self.rx_mode
+        self._rx_meter_next_at = time.monotonic() + 2.0
+        self._rx_meter_in_sq = 0.0
+        self._rx_meter_out_sq = 0.0
+        self._rx_meter_in_count = 0
+        self._rx_meter_out_count = 0
+        self._rx_meter_out_nonzero = 0
+        self._rx_meter_in_crc = 0
+        self._rx_meter_out_crc = 0
+        self._rx_meter_in_peak = 0.0
+        self._rx_meter_out_peak = 0.0
+
         # RX speaker suppression.  Detector sees the original audio immediately,
         # while playback/decrypt waits a short fixed look-ahead.  As soon as a
         # sync preamble is recognized we know the complete marker interval and
@@ -261,8 +276,8 @@ class LiveProcessor:
             return self.rx_mode
 
     def set_rx_mode(self, mode: str) -> None:
-        if mode not in {"raw", "correct", "wrong"}:
-            raise ValueError("mode must be raw/correct/wrong")
+        if mode not in {"mute", "raw", "correct", "wrong"}:
+            raise ValueError("mode must be mute/raw/correct/wrong")
         with self._rx_mode_lock:
             old = self.rx_mode
             self.rx_mode = mode
@@ -270,7 +285,8 @@ class LiveProcessor:
             "RX<-REMOTE", "MODE CHANGE",
             old=old, new=mode.upper(), locked=self.rx_locked,
             frame=self.rx_cipher.frame_index,
-            reason=("RAW=received ciphertext" if mode == "raw" else
+            reason=("MUTE=RX output forced to zero" if mode == "mute" else
+                    "RAW=received ciphertext" if mode == "raw" else
                     "CORRECT=real key; silence until FULL" if mode == "correct" else
                     "WRONG=deliberately wrong key; silence until FULL"),
         )
@@ -830,6 +846,9 @@ class LiveProcessor:
         # RAW is the actual incoming PCM before any marker suppression.
         raw_listen = segment if raw_unmodified is None else raw_unmodified
         mode = self.get_rx_mode()
+        if mode == "mute" and not self.rx_locked:
+            output_parts.append(np.zeros_like(segment))
+            return
         if not self.rx_locked:
             # CRITICAL: previous build silently passed ciphertext unchanged in
             # CORRECT mode. That made an unencrypted/bypassed browser route look
@@ -851,7 +870,12 @@ class LiveProcessor:
         finally:
             self.rx_cipher.key = self._rx_correct_key
 
-        if mode == "raw":
+        if mode == "mute":
+            # Advance the cipher, but output the same sample count as a normal
+            # decrypted segment would have generated: digital silence.
+            if restored.size:
+                output_parts.append(np.zeros_like(restored))
+        elif mode == "raw":
             # Raw received PCM BEFORE optional sync-mute, no decrypt or gain
             # compensation. Decoder state was still advanced above.
             output_parts.append(raw_listen.copy())
@@ -903,6 +927,63 @@ class LiveProcessor:
         # IMPORTANT: do not reset RX look-ahead/mute absolute state here.
         # Those cursors must remain monotonic for the lifetime of the stream.
         # diagnostics_snapshot() resets only interval counters inside the detector.
+
+    def _meter_rx_path(self, incoming: np.ndarray, outgoing: bytes) -> None:
+        """Every two seconds prove whether THIS application emitted audio."""
+        mode = self.get_rx_mode()
+        if mode != self._rx_meter_mode:
+            self._rx_meter_mode = mode
+            self._rx_meter_next_at = time.monotonic() + 2.0
+            self._rx_meter_in_sq = self._rx_meter_out_sq = 0.0
+            self._rx_meter_in_count = self._rx_meter_out_count = 0
+            self._rx_meter_out_nonzero = 0
+            self._rx_meter_in_crc = self._rx_meter_out_crc = 0
+            self._rx_meter_in_peak = self._rx_meter_out_peak = 0.0
+
+        incoming = np.asarray(incoming, dtype=np.float64)
+        if incoming.size:
+            self._rx_meter_in_sq += float(np.dot(incoming, incoming))
+            self._rx_meter_in_count += int(incoming.size)
+            self._rx_meter_in_peak = max(self._rx_meter_in_peak, float(np.max(np.abs(incoming))))
+            self._rx_meter_in_crc = zlib.crc32(
+                np.rint(np.clip(incoming, -1.0, 0.9999695) * 32768.0).astype('<i2').tobytes(),
+                self._rx_meter_in_crc,
+            )
+
+        if outgoing:
+            arr = np.frombuffer(outgoing, dtype='<i2')
+            norm = arr.astype(np.float64) / 32768.0
+            self._rx_meter_out_sq += float(np.dot(norm, norm))
+            self._rx_meter_out_count += int(norm.size)
+            self._rx_meter_out_nonzero += int(np.count_nonzero(arr))
+            self._rx_meter_out_peak = max(self._rx_meter_out_peak, float(np.max(np.abs(norm))))
+            self._rx_meter_out_crc = zlib.crc32(outgoing, self._rx_meter_out_crc)
+
+        if time.monotonic() < self._rx_meter_next_at:
+            return
+        self._rx_meter_next_at = time.monotonic() + 2.0
+        def dbfs(sumsq: float, count: int) -> str:
+            if not count or sumsq <= 0:
+                return '-240.0'
+            return f'{20.0 * np.log10(max(np.sqrt(sumsq / count), 1e-12)):.1f}'
+        self._log(
+            'RX<-REMOTE', 'AUDIO_PATH',
+            mode=mode.upper(), locked=self.rx_locked,
+            input_samples=self._rx_meter_in_count,
+            input_rms_dbfs=dbfs(self._rx_meter_in_sq, self._rx_meter_in_count),
+            input_peak_dbfs=dbfs(self._rx_meter_in_peak ** 2, 1),
+            input_crc32=f'{self._rx_meter_in_crc:08x}',
+            output_samples=self._rx_meter_out_count,
+            output_rms_dbfs=dbfs(self._rx_meter_out_sq, self._rx_meter_out_count),
+            output_peak_dbfs=dbfs(self._rx_meter_out_peak ** 2, 1),
+            output_nonzero=self._rx_meter_out_nonzero,
+            output_crc32=f'{self._rx_meter_out_crc:08x}',
+        )
+        self._rx_meter_in_sq = self._rx_meter_out_sq = 0.0
+        self._rx_meter_in_count = self._rx_meter_out_count = 0
+        self._rx_meter_out_nonzero = 0
+        self._rx_meter_in_crc = self._rx_meter_out_crc = 0
+        self._rx_meter_in_peak = self._rx_meter_out_peak = 0.0
 
     def _should_mute_window(self, window: DetectedMarkerWindow) -> bool:
         if self.rx_sync_mute == "off":
@@ -1109,6 +1190,7 @@ class LiveProcessor:
         self._rx_process_calls += 1
         self._rx_process_max_ms = max(self._rx_process_max_ms, elapsed_ms)
         self._maybe_log_sync_diagnostics()
+        self._meter_rx_path(incoming, out_bytes)
         return out_bytes
 
 
@@ -1152,8 +1234,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--key", default="key.bin")
     parser.add_argument(
-        "--rx-mode", choices=["raw", "correct", "wrong"], default="correct",
-        help="initial RX listening mode; change live with 1/2/3 then ENTER",
+        "--rx-mode", choices=["mute", "raw", "correct", "wrong"], default="correct",
+        help="initial RX listening mode; change live with 0/1/2/3 then ENTER",
     )
     parser.add_argument("--sync-period", type=float, default=0.5)
     parser.add_argument(
@@ -1468,6 +1550,7 @@ def run(args: argparse.Namespace) -> None:
         print("  Microphone = TX_Microphone")
         print("  Speakers   = RX_sink")
         print("RX LISTENING MODES (enter digit and press ENTER):", flush=True)
+        print("  0 = MUTE     : zero RX output; proves whether sound bypasses app", flush=True)
         print("  1 = RAW      : received ciphertext, no decryption", flush=True)
         print("  2 = CORRECT  : correct key, only AFTER CRC32-verified FULL", flush=True)
         print("  3 = WRONG    : deliberately wrong key, only AFTER FULL", flush=True)
@@ -1491,8 +1574,8 @@ def run(args: argparse.Namespace) -> None:
                 stop_event.wait(0.25)
                 continue
             cmd = line.strip().lower()
-            if cmd in {"1", "2", "3"}:
-                processor.set_rx_mode({"1": "raw", "2": "correct", "3": "wrong"}[cmd])
+            if cmd in {"0", "1", "2", "3"}:
+                processor.set_rx_mode({"0": "mute", "1": "raw", "2": "correct", "3": "wrong"}[cmd])
             elif cmd in {"q", "quit", "exit"}:
                 print("Stopping by console command...", flush=True)
                 stop_event.set()
@@ -1508,7 +1591,7 @@ def run(args: argparse.Namespace) -> None:
                     ), flush=True,
                 )
             else:
-                print("Unknown command. Use 1 / 2 / 3 / ENTER / q", flush=True)
+                print("Unknown command. Use 0 / 1 / 2 / 3 / ENTER / q", flush=True)
     finally:
         if bridge is not None:
             bridge.stop()
