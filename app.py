@@ -9,6 +9,10 @@ from datetime import datetime
 from pathlib import Path
 import hashlib
 import zlib
+import wave
+import queue
+import csv
+import subprocess
 import os
 import socket
 import sys
@@ -36,6 +40,91 @@ from robust_sync import (
 from sync import FrameSynchronizer, SyncInfo
 
 
+class AudioWavRecorder:
+    """Non-blocking, bounded 5-tap PCM16 recorder; files are not part of the live data path.
+
+    All WAVs use one rate/channel layout.  RX masked capture is recorded at its
+    actual pre-decrypt position; RX speaker capture is exactly the PCM bytes
+    returned to the pacat playback worker.  The streams may differ in length
+    due to transform warmup and fixed RX look-ahead; align with RX CP log
+    coordinates, not by assuming all stems have the same start time.
+    """
+
+    TAP_NAMES = ("tx_mic", "tx_tunnel", "rx_input", "rx_masked", "rx_speaker")
+
+    def __init__(self, directory: Path, sample_rate: int, duration_sec: float):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.sample_rate = int(sample_rate)
+        self.max_frames = int(round(duration_sec * sample_rate))
+        self.queue = queue.Queue(maxsize=4096)
+        self.frames = {name: 0 for name in self.TAP_NAMES}
+        self.drops = {name: 0 for name in self.TAP_NAMES}
+        self.paths = {name: self.directory / (name + ".wav") for name in self.TAP_NAMES}
+        self.files = {}
+        for name, path in self.paths.items():
+            file = wave.open(str(path), "wb")
+            file.setnchannels(1)
+            file.setsampwidth(2)
+            file.setframerate(sample_rate)
+            self.files[name] = file
+        self.event_path = self.directory / "events.csv"
+        self.event_file = self.event_path.open("w", encoding="utf-8", newline="")
+        self.event_writer = csv.writer(self.event_file)
+        self.event_writer.writerow(["wallclock", "direction", "event", "fields"])
+        self.worker = threading.Thread(target=self._worker, name="wav-recorder", daemon=True)
+        self.worker.start()
+
+    def _worker(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                self.queue.task_done()
+                break
+            kind, name, data = item
+            try:
+                if kind == "wav":
+                    remaining = self.max_frames - self.frames[name]
+                    if remaining > 0:
+                        payload = data[:remaining * 2]
+                        self.files[name].writeframesraw(payload)
+                        self.frames[name] += len(payload) // 2
+                elif kind == "event":
+                    self.event_writer.writerow(data)
+            finally:
+                self.queue.task_done()
+
+    def tap(self, name: str, pcm_bytes: bytes):
+        if name not in self.frames or not pcm_bytes or self.frames[name] >= self.max_frames:
+            return
+        try:
+            self.queue.put_nowait(("wav", name, pcm_bytes))
+        except queue.Full:
+            self.drops[name] += 1
+
+    def event(self, direction: str, event: str, fields: dict):
+        if event not in {"CP PREAMBLE DETECT", "CP CUT APPLIED", "CP FULL CUT APPLIED", "CP CUT TOO LATE", "FULL APPLY", "CHECKPOINT TRACK", "CHECKPOINT APPLY", "MODE CHANGE", "REALTIME GAP"}:
+            return
+        line = [datetime.now().astimezone().isoformat(timespec="milliseconds"), direction, event,
+                " ".join("%s=%s" % (k, v) for k,v in fields.items())]
+        try:
+            self.queue.put_nowait(("event", "", line))
+        except queue.Full:
+            pass
+
+    def close(self):
+        self.queue.put(None)
+        self.queue.join()
+        self.worker.join(timeout=10.0)
+        for f in self.files.values():
+            f.close()
+        self.event_file.close()
+        print("AUDIO CAPTURE DIR  :", self.directory.resolve())
+        for name in self.TAP_NAMES:
+            print("AUDIO CAPTURE      : %s frames=%d dropped_chunks=%d path=%s" %
+                  (name, self.frames[name], self.drops[name], self.paths[name].resolve()), flush=True)
+
+
 @dataclass
 class _PendingMarker:
     kind: str  # FULL | CHECKPOINT
@@ -46,7 +135,7 @@ class LiveProcessor:
     """Real-time cipher + robust in-band sync.
 
     Architecture:
-      * one strong CRC32 FULL establishes nonce + absolute frame index;
+      * one strong CRC32 FULL establishes absolute frame index;
       * after lock both sides count frames locally;
       * short periodic checkpoints carry only frame_index mod 64;
       * checkpoints are confidence/plausibility checked and a non-zero
@@ -91,8 +180,10 @@ class LiveProcessor:
         rx_full_mute_threshold: float,
         rx_checkpoint_mute_threshold: float,
         rx_sync_mute_fade_ms: float,
+        rx_checkpoint_suppress: str = "preamble",
         rx_mode: str = "correct",
         wrong_key: bytes | None = None,
+        recorder: AudioWavRecorder | None = None,
     ):
         if not (0.0 < ciphertext_gain <= 1.0):
             raise ValueError("ciphertext_gain must be in (0, 1]")
@@ -113,6 +204,7 @@ class LiveProcessor:
         if tx_cipher.hop_size != rx_cipher.hop_size:
             raise ValueError("TX and RX hop sizes must match")
 
+        self.recorder = recorder
         self.tx_cipher = tx_cipher
         self.rx_cipher = rx_cipher
         # One decryptor, two test keys. Switching keys at the spectral frame
@@ -120,8 +212,8 @@ class LiveProcessor:
         # second expensive MDCT/STFT decryptor in parallel.
         self._rx_correct_key = rx_cipher.key
         self._rx_wrong_key = wrong_key or hashlib.sha256(b"WRONG-RX-TEST:" + self._rx_correct_key).digest()
-        if rx_mode not in {"mute", "raw", "correct", "wrong"}:
-            raise ValueError("rx_mode must be mute/raw/correct/wrong")
+        if rx_mode not in {"mute", "raw", "masked_raw", "correct", "wrong"}:
+            raise ValueError("rx_mode must be mute/raw/masked_raw/correct/wrong")
         self.rx_mode = rx_mode
         self._rx_mode_lock = threading.Lock()
         self._last_unlocked_log = 0.0
@@ -136,6 +228,8 @@ class LiveProcessor:
             raise ValueError("checkpoint_audio_gain must be in [0, 1]")
         if rx_sync_mute not in {"off", "checkpoint", "all"}:
             raise ValueError("rx_sync_mute must be off, checkpoint or all")
+        if rx_checkpoint_suppress not in {"preamble", "all"}:
+            raise ValueError("rx_checkpoint_suppress must be preamble or all")
         if rx_sync_lookahead_ms < 0.0:
             raise ValueError("rx_sync_lookahead_ms must be >= 0")
         if not (0.0 <= rx_full_mute_threshold <= 1.0):
@@ -148,6 +242,7 @@ class LiveProcessor:
         self.full_audio_gain = float(full_audio_gain)
         self.checkpoint_audio_gain = float(checkpoint_audio_gain)
         self.rx_sync_mute = rx_sync_mute
+        self.rx_checkpoint_suppress = rx_checkpoint_suppress
         self.rx_sync_lookahead_samples = int(
             round(self.sample_rate * float(rx_sync_lookahead_ms) / 1000.0)
         )
@@ -270,14 +365,22 @@ class LiveProcessor:
         self._rx_hold = np.empty(0, dtype=np.float64)
         self._rx_pending_events: list[DetectedSyncEvent] = []
         self._rx_mute_intervals: list[tuple[int, int, str, float]] = []
+        self._rx_cp_preamble_zeroed = 0
+        self._rx_cp_preamble_zeroed_total = 0
+        self._rx_cp_full_zeroed_total = 0
+        self._rx_cp_detected_total = 0
+        self._rx_cp_detected_late_total = 0
+        self._rx_cp_masked_segments_total = 0
+        self._rx_cp_masked_input_power = 0.0
+        self._rx_current_feed_end_abs = 0
 
     def get_rx_mode(self) -> str:
         with self._rx_mode_lock:
             return self.rx_mode
 
     def set_rx_mode(self, mode: str) -> None:
-        if mode not in {"mute", "raw", "correct", "wrong"}:
-            raise ValueError("mode must be mute/raw/correct/wrong")
+        if mode not in {"mute", "raw", "masked_raw", "correct", "wrong"}:
+            raise ValueError("mode must be mute/raw/masked_raw/correct/wrong")
         with self._rx_mode_lock:
             old = self.rx_mode
             self.rx_mode = mode
@@ -286,7 +389,8 @@ class LiveProcessor:
             old=old, new=mode.upper(), locked=self.rx_locked,
             frame=self.rx_cipher.frame_index,
             reason=("MUTE=RX output forced to zero" if mode == "mute" else
-                    "RAW=received ciphertext" if mode == "raw" else
+                    "RAW=received ciphertext; sync-mute bypassed" if mode == "raw" else
+                    "MASKED_RAW=received PCM after sync-mute; no decrypt" if mode == "masked_raw" else
                     "CORRECT=real key; silence until FULL" if mode == "correct" else
                     "WRONG=deliberately wrong key; silence until FULL"),
         )
@@ -299,6 +403,8 @@ class LiveProcessor:
             + (f" {tail}" if tail else ""),
             flush=True,
         )
+        if self.recorder is not None:
+            self.recorder.event(direction, event, fields)
 
     @staticmethod
     def _bytes_to_float(data: bytes) -> np.ndarray:
@@ -541,13 +647,27 @@ class LiveProcessor:
             return
 
         skipped_samples = dropped_blocks * block_samples
+        # The detector already received the held 100ms, but the decryptor has
+        # not: its audio was waiting in the RX look-ahead queue. On a capture
+        # discontinuity we discard that stale held audio and advance the cipher
+        # over BOTH the held portion and the newly missing part. Otherwise the
+        # decoder's absolute counter diverges from the playback cursor.
+        held_samples = int(self._rx_hold.size)
         self.sync_decoder.skip_samples(skipped_samples)
+        self._rx_input_total_abs += skipped_samples
+        self._rx_hold = np.empty(0, dtype=np.float64)
+        self._rx_hold_start_abs = self._rx_input_total_abs
+        self._rx_pending_events.clear()
+        self._rx_mute_intervals.clear()
 
         before = int(self.rx_cipher.frame_index)
         if self.rx_locked:
-            zero = np.zeros(block_samples, dtype=np.float64)
-            for _ in range(dropped_blocks):
-                self.rx_cipher.decrypt(zero)
+            missing_for_cipher = held_samples + skipped_samples
+            block = np.zeros(min(block_samples, self.hop_size), dtype=np.float64)
+            while missing_for_cipher > 0:
+                count = min(missing_for_cipher, block.size)
+                self.rx_cipher.decrypt(block[:count])
+                missing_for_cipher -= count
         after = int(self.rx_cipher.frame_index)
 
         self._pending_checkpoint_drift = None
@@ -556,13 +676,18 @@ class LiveProcessor:
             "RX<-REMOTE",
             "REALTIME GAP",
             dropped_blocks=dropped_blocks,
+            held_discarded_samples=held_samples,
+            gap_skipped_samples=skipped_samples,
             frame_before=before,
             frame_after=after,
             locked=self.rx_locked,
-            action=("ZERO_ADVANCE" if self.rx_locked else "WAIT_FULL"),
+            action=("ZERO_ADVANCE_CLEAR_LOOKAHEAD" if self.rx_locked else "WAIT_FULL_CLEAR_LOOKAHEAD"),
+            decoder_app_offset_samples=int(self.sync_decoder._total_abs - self._rx_input_total_abs),
         )
 
     def process_tx(self, data: bytes) -> bytes:
+        if self.recorder is not None:
+            self.recorder.tap("tx_mic", data)
         pcm = self._bytes_to_float(data)
         self._accumulate_tx_raw(pcm)
 
@@ -597,7 +722,10 @@ class LiveProcessor:
         if after > before:
             self._schedule_next_marker()
 
-        return self._float_to_bytes(encrypted)
+        encoded_bytes = self._float_to_bytes(encrypted)
+        if self.recorder is not None:
+            self.recorder.tap("tx_tunnel", encoded_bytes)
+        return encoded_bytes
 
     @staticmethod
     def _nearest_modulo_frame(local_frame: int, frame_mod: int, modulus: int) -> int:
@@ -855,6 +983,8 @@ class LiveProcessor:
             # like successful decryption. Fail closed instead.
             if mode == "raw":
                 output_parts.append(raw_listen.copy())
+            elif mode == "masked_raw":
+                output_parts.append(segment.copy())
             else:
                 output_parts.append(np.zeros_like(segment))
             return
@@ -879,6 +1009,10 @@ class LiveProcessor:
             # Raw received PCM BEFORE optional sync-mute, no decrypt or gain
             # compensation. Decoder state was still advanced above.
             output_parts.append(raw_listen.copy())
+        elif mode == "masked_raw":
+            # Same incoming PCM, but WITH preamble suppression. Makes it
+            # possible to prove muting without STFT overlap/decryption.
+            output_parts.append(segment.copy())
         elif restored.size:
             output_parts.append(restored)
 
@@ -920,9 +1054,19 @@ class LiveProcessor:
                 else f"{self._large_drift_estimate:.2f}:{self._large_drift_count}"
             ),
             rx_proc_max_ms=f"{self._rx_process_max_ms:.2f}",
+            cp_preamble_zeroed_samples=self._rx_cp_preamble_zeroed,
+            cp_preamble_zeroed_total=self._rx_cp_preamble_zeroed_total,
+            cp_full_zeroed_total=self._rx_cp_full_zeroed_total,
+            cp_cut_mode=self.rx_checkpoint_suppress,
+            cp_detected_total=self._rx_cp_detected_total,
+            cp_late_total=self._rx_cp_detected_late_total,
+            cp_mask_segments_total=self._rx_cp_masked_segments_total,
+            cp_muted_input_energy=f"{self._rx_cp_masked_input_power:.5f}",
+            decoder_app_offset_samples=int(self.sync_decoder._total_abs - self._rx_input_total_abs),
         )
         self._rx_process_max_ms = 0.0
         self._rx_process_calls = 0
+        self._rx_cp_preamble_zeroed = 0
 
         # IMPORTANT: do not reset RX look-ahead/mute absolute state here.
         # Those cursors must remain monotonic for the lifetime of the stream.
@@ -991,7 +1135,10 @@ class LiveProcessor:
         if window.kind == "checkpoint":
             if self.rx_sync_mute not in {"checkpoint", "all"}:
                 return False
-            return window.preamble_score >= self.rx_checkpoint_mute_threshold
+            # The physical decoder has ALREADY accepted this preamble.
+            # In preamble-only mode suppression must not introduce a second,
+            # stricter threshold that lets a detected chirp reach speakers.
+            return True  # valid decoded preamble -> mute, independent of symbol decoding
         if window.kind == "full":
             if self.rx_sync_mute != "all":
                 return False
@@ -999,11 +1146,45 @@ class LiveProcessor:
         return False
 
     def _add_mute_window(self, window: DetectedMarkerWindow) -> None:
+        start_abs = int(window.start_abs)
+        if window.kind == "checkpoint":
+            self._rx_cp_detected_total += 1
+            late_samples = max(0, int(self._rx_hold_start_abs) - start_abs)
+            if late_samples:
+                self._rx_cp_detected_late_total += 1
+            will_cut = self._should_mute_window(window)
+            self._log(
+                "RX<-REMOTE", "CP PREAMBLE DETECT",
+                score=f"{window.preamble_score:.3f}",
+                start_abs=start_abs,
+                detector_delay_ms=f"{1000.0 * (self._rx_current_feed_end_abs - start_abs) / self.sample_rate:.2f}",
+                playback_cursor=self._rx_hold_start_abs,
+                late_samples=late_samples,
+                will_cut=will_cut,
+                rx_mode=self.get_rx_mode().upper(),
+                raw_bypasses_cut=(self.get_rx_mode() == "raw"),
+            )
+            if late_samples:
+                self._log(
+                    "RX<-REMOTE", "CP CUT TOO LATE",
+                    already_played_samples=late_samples,
+                    advice="increase_--rx-sync-lookahead-ms",
+                )
         if not self._should_mute_window(window):
             return
 
-        start_abs = int(window.start_abs)
         end_abs = int(window.end_abs)
+        if window.kind == "checkpoint" and self.rx_checkpoint_suppress == "preamble":
+            # The preamble is the only part silenced.  The DTMF-like data
+            # remains in the received PCM and is decrypted as usual; the
+            # synchronization detector always receives unmodified input.
+            end_abs = start_abs + self.sync_codec.checkpoint_preamble_samples
+            window = DetectedMarkerWindow(
+                kind="checkpoint_preamble",
+                start_abs=start_abs,
+                end_abs=end_abs,
+                preamble_score=window.preamble_score,
+            )
         if end_abs <= start_abs:
             return
 
@@ -1043,7 +1224,9 @@ class LiveProcessor:
             "SYNC MUTE",
             kind=window.kind,
             preamble=f"{window.preamble_score:.3f}",
-            marker_ms=f"{1000.0 * (end_abs - start_abs) / self.sample_rate:.1f}",
+            muted_ms=f"{1000.0 * (end_abs - start_abs) / self.sample_rate:.1f}",
+            checkpoint_mode=self.rx_checkpoint_suppress,
+            note="scheduled_for_delayed_playback",
         )
 
     def _mask_sync_audio(self, samples: np.ndarray, start_abs: int) -> np.ndarray:
@@ -1055,7 +1238,59 @@ class LiveProcessor:
         seg_end = seg_start + int(out.size)
         fade = max(0, int(self.rx_sync_mute_fade_samples))
 
-        for mute_start, mute_end, _kind, _score in self._rx_mute_intervals:
+        for mute_start, mute_end, kind, _score in self._rx_mute_intervals:
+            if kind in {"checkpoint_preamble", "checkpoint", "mixed"}:
+                # DIAGNOSTIC: strictly zero the entire detected CP interval in
+                # 'all' mode (including symbols AND alignment padding).  The
+                # decoder receives unmodified RX audio, and can still decode.
+                # Use only a 1-ms taper OUTSIDE the marked interval.  Never
+                # put a nonzero fade INSIDE the marker, as the old all mode did.
+                edge = min(fade, self.sample_rate // 1000)
+                left = max(seg_start, mute_start - edge)
+                right = min(seg_end, mute_end + edge)
+                if right <= left:
+                    continue
+                indices = np.arange(left, right, dtype=np.int64)
+                gains = np.zeros(indices.size, dtype=np.float64)
+                if edge > 0:
+                    pre = indices < mute_start
+                    post = indices >= mute_end
+                    if np.any(pre):
+                        u = (mute_start - indices[pre]) / float(edge)
+                        gains[pre] = np.sin(0.5 * np.pi * np.clip(u, 0, 1)) ** 2
+                    if np.any(post):
+                        u = (indices[post] - mute_end) / float(edge)
+                        gains[post] = np.sin(0.5 * np.pi * np.clip(u, 0, 1)) ** 2
+                in_piece = out[left - seg_start:right - seg_start].copy()
+                out[left - seg_start:right - seg_start] *= gains
+                zero_left = max(left, mute_start)
+                zero_right = min(right, mute_end)
+                if zero_right > zero_left:
+                    zeroed = zero_right - zero_left
+                    event = "CP CUT APPLIED" if kind == "checkpoint_preamble" else "CP FULL CUT APPLIED"
+                    if kind == "checkpoint_preamble":
+                        self._rx_cp_preamble_zeroed += zeroed
+                        self._rx_cp_preamble_zeroed_total += zeroed
+                        total = self._rx_cp_preamble_zeroed_total
+                    else:
+                        self._rx_cp_full_zeroed_total += zeroed
+                        total = self._rx_cp_full_zeroed_total
+                    self._rx_cp_masked_segments_total += 1
+                    self._rx_cp_masked_input_power += float(np.dot(in_piece, in_piece))
+                    self._log(
+                        "RX<-REMOTE", event,
+                        start_abs=zero_left,
+                        end_abs=zero_right,
+                        zeroed_samples=zeroed,
+                        zeroed_total=total,
+                        input_peak=f"{float(np.max(np.abs(in_piece))):.5f}",
+                        cut_pcm_peak=f"{float(np.max(np.abs(out[zero_left-seg_start:zero_right-seg_start]))):.8f}",
+                        rx_mode=self.get_rx_mode().upper(),
+                        output_uses_mask=(self.get_rx_mode() != "raw"),
+                    )
+                continue
+
+            # Full marker and legacy full-checkpoint muting are unchanged.
             left = max(seg_start, mute_start)
             right = min(seg_end, mute_end)
             if right <= left:
@@ -1064,22 +1299,16 @@ class LiveProcessor:
             i0 = left - seg_start
             i1 = right - seg_start
             gain = np.zeros(i1 - i0, dtype=np.float64)
-
             if fade > 0:
-                # Fade down just inside the marker start and fade back up just
-                # before marker end.  This prevents hard zero-boundary clicks.
                 for idx in range(i1 - i0):
                     abs_pos = left + idx
                     dist_from_start = abs_pos - mute_start
                     dist_to_end = mute_end - abs_pos - 1
                     edge = min(dist_from_start, dist_to_end)
                     if edge < fade:
-                        # 1.0 at the outer marker boundary -> 0.0 after the
-                        # short fade, and symmetrically back to 1.0 at the end.
                         gain[idx] = np.cos(
                             0.5 * np.pi * max(0.0, float(edge)) / float(fade)
                         ) ** 2
-
             out[i0:i1] *= gain
 
         return out
@@ -1108,6 +1337,8 @@ class LiveProcessor:
                 i1 = event_end - raw_start_abs
                 unmodified = raw[i0:i1]
                 piece = self._mask_sync_audio(unmodified, cursor_abs)
+                if self.recorder is not None:
+                    self.recorder.tap("rx_masked", self._float_to_bytes(piece))
                 self._decrypt_segment(piece, output_parts, raw_unmodified=unmodified)
 
             self._handle_detected_event(event)
@@ -1117,6 +1348,8 @@ class LiveProcessor:
             i0 = cursor_abs - raw_start_abs
             unmodified = raw[i0:]
             piece = self._mask_sync_audio(unmodified, cursor_abs)
+            if self.recorder is not None:
+                self.recorder.tap("rx_masked", self._float_to_bytes(piece))
             self._decrypt_segment(piece, output_parts, raw_unmodified=unmodified)
 
         if not output_parts:
@@ -1124,10 +1357,13 @@ class LiveProcessor:
         return self._float_to_bytes(np.concatenate(output_parts))
 
     def process_rx(self, data: bytes) -> bytes:
+        if self.recorder is not None:
+            self.recorder.tap("rx_input", data)
         started = time.perf_counter()
         incoming = self._bytes_to_float(data)
         block_start_abs = int(self._rx_input_total_abs)
         block_end_abs = block_start_abs + int(incoming.size)
+        self._rx_current_feed_end_abs = block_end_abs
 
         # Detector always receives untouched WebRTC audio.  Speaker muting is a
         # separate branch and therefore cannot make sync detection worse.
@@ -1191,6 +1427,8 @@ class LiveProcessor:
         self._rx_process_max_ms = max(self._rx_process_max_ms, elapsed_ms)
         self._maybe_log_sync_diagnostics()
         self._meter_rx_path(incoming, out_bytes)
+        if self.recorder is not None:
+            self.recorder.tap("rx_speaker", out_bytes)
         return out_bytes
 
 
@@ -1233,9 +1471,13 @@ def parse_args() -> argparse.Namespace:
         default="per_frame",
     )
     parser.add_argument("--key", default="key.bin")
+    parser.add_argument("--record-audio", action="store_true", help="record 5 PCM16 WAV taps and sync events for debugging")
+    parser.add_argument("--record-seconds", type=float, default=35.0, help="maximum duration PER TAP in seconds (default: 35)")
+    parser.add_argument("--record-dir", default="", help="output directory (default: log-dir/audio/<timestamp>)")
+    parser.add_argument("--keep-loopbacks", action="store_true", help="do NOT unload PulseAudio module-loopback on exit (default: remove all)")
     parser.add_argument(
-        "--rx-mode", choices=["mute", "raw", "correct", "wrong"], default="correct",
-        help="initial RX listening mode; change live with 0/1/2/3 then ENTER",
+        "--rx-mode", choices=["mute", "raw", "masked_raw", "correct", "wrong"], default="correct",
+        help="initial RX listening mode; change live with 0/1/2/3/4 then ENTER",
     )
     parser.add_argument("--sync-period", type=float, default=0.5)
     parser.add_argument(
@@ -1258,13 +1500,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--full-preamble-amplitude", type=float, default=0.30)
     parser.add_argument("--full-symbol-amplitude", type=float, default=0.16)
-    parser.add_argument("--checkpoint-preamble-amplitude", type=float, default=0.30)
-    parser.add_argument("--checkpoint-symbol-amplitude", type=float, default=0.14)
-    parser.add_argument("--full-audio-gain", type=float, default=0.58)
+    parser.add_argument("--checkpoint-preamble-amplitude", type=float, default=0.55)
+    parser.add_argument("--checkpoint-symbol-amplitude", type=float, default=0.01)#0.14
+    parser.add_argument("--full-audio-gain", type=float, default=1)#0.58
     parser.add_argument("--checkpoint-audio-gain", type=float, default=0.67)
     parser.add_argument("--full-preamble-ms", type=float, default=60.0)
     parser.add_argument("--full-symbol-ms", type=float, default=8.0)
-    parser.add_argument("--checkpoint-preamble-ms", type=float, default=16.0)
+    parser.add_argument("--checkpoint-preamble-ms", type=float, default=12.0)
     parser.add_argument("--checkpoint-symbol-ms", type=float, default=4.0)
     parser.add_argument("--full-detection-threshold", type=float, default=0.50)
     parser.add_argument("--checkpoint-detection-threshold", type=float, default=0.48)
@@ -1316,6 +1558,12 @@ def parse_args() -> argparse.Namespace:
         choices=["off", "checkpoint", "all"],
         default="all",
         help="suppress detected modem markers from local speakers",
+    )
+    parser.add_argument(
+        "--rx-checkpoint-suppress",
+        choices=["preamble", "all"],
+        default="preamble",
+        help="preamble: mute first 12ms only; all: strictly zero ENTIRE checkpoint incl. data (diagnostic)",
     )
     parser.add_argument(
         "--rx-sync-lookahead-ms",
@@ -1455,6 +1703,18 @@ def run(args: argparse.Namespace) -> None:
         args.transform, args.operation, key, args.key_schedule,
     )
 
+    recorder = None
+    if args.record_audio:
+        if not (1.0 <= args.record_seconds <= 600.0):
+            raise ValueError("--record-seconds must be between 1 and 600")
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        dirname = args.record_dir or str(Path(args.log_dir) / "audio" / (
+            "%s_%s_%s_%s" % (stamp, args.node, args.transform, args.operation)))
+        recorder = AudioWavRecorder(Path(dirname), RATE, args.record_seconds)
+        print("AUDIO CAPTURE ON   :", Path(dirname).resolve())
+        print("AUDIO CAPTURE FILES:", ", ".join(AudioWavRecorder.TAP_NAMES))
+        print("NOTE: WAVs may contain your microphone/other people's speech; review before sharing.")
+
     processor = LiveProcessor(
         tx_cipher=tx_cipher,
         rx_cipher=rx_cipher,
@@ -1491,8 +1751,10 @@ def run(args: argparse.Namespace) -> None:
         rx_full_mute_threshold=args.rx_full_mute_threshold,
         rx_checkpoint_mute_threshold=args.rx_checkpoint_mute_threshold,
         rx_sync_mute_fade_ms=args.rx_sync_mute_fade_ms,
+        rx_checkpoint_suppress=args.rx_checkpoint_suppress,
         rx_mode=args.rx_mode,
         wrong_key=hashlib.sha256(b"WRONG-RX-TEST:" + key).digest(),
+        recorder=recorder,
     )
 
     virtual_devices = PulseVirtualDevices()
@@ -1507,6 +1769,8 @@ def run(args: argparse.Namespace) -> None:
     print("Key schedule        :", args.key_schedule)
     print("Sync                : robust chirp + DTMF-like modem")
     print("RX MODE             :", processor.get_rx_mode().upper())
+    if processor.get_rx_mode() == "raw":
+        print("WARNING: RAW passes chirps unchanged! Type 4+ENTER to hear muted RAW, 2+ENTER for CORRECT.")
     print("RX fail-closed      : yes (CORRECT/WRONG silent until FULL)")
     print("WRONG test          : uses deliberately different key")
     if args.operation == "invert":
@@ -1520,6 +1784,11 @@ def run(args: argparse.Namespace) -> None:
     print("FULL audio gain     :", args.full_audio_gain)
     print("CP audio gain       :", args.checkpoint_audio_gain)
     print("RX sync mute        :", args.rx_sync_mute)
+    print("RX CHECKPOINT CUT   :", args.rx_checkpoint_suppress.upper(),
+          "(PREAMBLE=chirp only; ALL=entire CP preamble+data+padding, strict digital zero)")
+    print("CP preamble duration:", args.checkpoint_preamble_ms, "ms")
+    print("CP data duration    :", 6 * args.checkpoint_symbol_ms,
+          "ms (muted with ALL; kept with PREAMBLE)")
     print("RX mute lookahead   :", args.rx_sync_lookahead_ms, "ms")
     print("Initial FULL x      :", args.initial_full_repeats)
     print("Checkpoint modulo   : 64")
@@ -1551,7 +1820,8 @@ def run(args: argparse.Namespace) -> None:
         print("  Speakers   = RX_sink")
         print("RX LISTENING MODES (enter digit and press ENTER):", flush=True)
         print("  0 = MUTE     : zero RX output; proves whether sound bypasses app", flush=True)
-        print("  1 = RAW      : received ciphertext, no decryption", flush=True)
+        print("  1 = RAW      : received ciphertext, NO sync-mute (control)", flush=True)
+        print("  4 = MASKED_RAW: received ciphertext WITH sync-mute, NO decryption", flush=True)
         print("  2 = CORRECT  : correct key, only AFTER CRC32-verified FULL", flush=True)
         print("  3 = WRONG    : deliberately wrong key, only AFTER FULL", flush=True)
         print("  ENTER = show state   |   q = stop   |   Ctrl+C = stop", flush=True)
@@ -1574,8 +1844,8 @@ def run(args: argparse.Namespace) -> None:
                 stop_event.wait(0.25)
                 continue
             cmd = line.strip().lower()
-            if cmd in {"0", "1", "2", "3"}:
-                processor.set_rx_mode({"0": "mute", "1": "raw", "2": "correct", "3": "wrong"}[cmd])
+            if cmd in {"0", "1", "2", "3", "4"}:
+                processor.set_rx_mode({"0": "mute", "1": "raw", "2": "correct", "3": "wrong", "4": "masked_raw"}[cmd])
             elif cmd in {"q", "quit", "exit"}:
                 print("Stopping by console command...", flush=True)
                 stop_event.set()
@@ -1591,10 +1861,29 @@ def run(args: argparse.Namespace) -> None:
                     ), flush=True,
                 )
             else:
-                print("Unknown command. Use 0 / 1 / 2 / 3 / ENTER / q", flush=True)
+                print("Unknown command. Use 0 / 1 / 2 / 3 / 4 / ENTER / q", flush=True)
     finally:
         if bridge is not None:
             bridge.stop()
+        if recorder is not None:
+            recorder.close()
+        # User-requested cleanup: all PulseAudio module-loopback instances.
+        # Run BEFORE removing our null sinks. Can be disabled if the host uses
+        # unrelated loopbacks (e.g. audio monitoring/routing).
+        if not args.keep_loopbacks:
+            try:
+                out = virtual_devices.pactl("list", "short", "modules")
+                ids = [line.split()[0] for line in out.splitlines()
+                       if len(line.split()) >= 2 and line.split()[1] == "module-loopback"]
+                for module_id in ids:
+                    try:
+                        virtual_devices.pactl("unload-module", module_id)
+                        print("LOOPBACK CLEANUP: unloaded module", module_id, flush=True)
+                    except (subprocess.CalledProcessError, OSError) as err:
+                        print("LOOPBACK CLEANUP: failed", module_id, str(err), flush=True)
+                print("LOOPBACK CLEANUP: found=%d" % len(ids), flush=True)
+            except (subprocess.CalledProcessError, OSError) as err:
+                print("LOOPBACK CLEANUP: unavailable:", str(err), flush=True)
         virtual_devices.stop()
 
 
