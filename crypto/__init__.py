@@ -1,5 +1,3 @@
-from .base import SpectralCipher
-from .stft import STFTCipher
-from .mdct import MDCTCipher
+from .adapter import make_frame_cipher, BuiltinFrameCipher
 
-__all__ = ["SpectralCipher", "STFTCipher", "MDCTCipher"]
+__all__ = ["make_frame_cipher", "BuiltinFrameCipher"]

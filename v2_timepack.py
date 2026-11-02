@@ -47,7 +47,7 @@ class SyncV1Config:
     gapRecoveryThreshold: float = 0.28
     gapRecoveryRadius: int = 16
     gapRecoveryMaxFrames: int = 64
-    gapRecoveryAllowEstimated: bool = True
+    gapRecoveryAllowEstimated: bool = False
     gapRecoveryMaxAnchorPredictionError: float = 1.0
     wallAlpha: float = 0.08
     searchWindowFrames: int = 32
@@ -472,6 +472,13 @@ class FixedGuardSyncV1:
             guardPos = positions[frameIdx]
             core, correction = self._coreBetweenPositions(prevGuardPos, guardPos)
             usesEstimate = sources[frameIdx - 1] == 'estimated' or sources[frameIdx] == 'estimated'
+            # A guard whose position was only estimated MUST NOT validate a PCM frame.
+            # A *detected* right-hand guard identifies its own preceding 320 samples
+            # even when the previous guard was lost (whole-packet drop).
+            if sources[frameIdx - 1] == 'estimated' and sources[frameIdx] in ('detected','anchor'):
+                core = self._coreAt(guardPos)
+                correction = 0 if core is not None else None
+                usesEstimate = False
             canUse = core is not None and (self.cfg.gapRecoveryAllowEstimated or not usesEstimate)
             if canUse:
                 status = 'ok'
@@ -659,7 +666,7 @@ class FixedGuardSyncV1:
             return True
         candidateUsable = expectedGuardPos is not None and expectedCorr >= self.cfg.trackThreshold
         candidateTimingError = float(expectedGuardPos - expectedPos) if expectedGuardPos is not None else None
-        candidateTrusted = candidateUsable and abs(candidateTimingError) <= self.cfg.trackContinuityRadius
+        candidateTrusted = candidateUsable and abs(candidateTimingError) <= self.cfg.trackContinuityRadius and expectedCorr >= self.cfg.trackStrongThreshold
         if candidateTrusted:
             guardPos = expectedGuardPos
             corr = expectedCorr

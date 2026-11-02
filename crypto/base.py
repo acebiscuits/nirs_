@@ -41,18 +41,13 @@ class SpectralCipher(ABC):
         self.frame_index = frame_index
         self._reset_stream_state()
 
-    def set_frame_index(self, frame_index: int) -> None:
-        if frame_index < 0:
-            raise ValueError("frame_index must be >= 0")
-        self.frame_index = frame_index
-
     def _require_key(self) -> None:
         if not self.key:
             raise ValueError(f"operation '{self.operation}' requires key bytes")
 
     def _rng_for_frame(self) -> np.random.Generator:
         self._require_key()
-        effective_frame = self.frame_index if self.key_schedule == "per_frame" else 0
+        effective_frame = (self.frame_index % 64) if self.key_schedule == "per_frame" else 0
 
         h = hashlib.sha512()
         h.update(self.key)

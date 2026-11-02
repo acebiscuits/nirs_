@@ -15,8 +15,8 @@ with tempfile.TemporaryDirectory() as tmp:
         t = np.arange(16000 * 3)/16000
         f.writeframes((np.sin(t*2*np.pi*233)*6000).astype('<i2').tobytes())
     base = [sys.executable, str(root/'main.py'), '--key-file', str(folder/'key.bin')]
-    subprocess.run(base + ['--role','tx','--input',str(folder/'input.wav'),'--out',str(folder/'tx')], check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(base + ['--role','rx','--input',str(folder/'tx/tx_wire.wav'),'--out',str(folder/'rx')], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(base + ['--role','tx','--pilot-seconds','2','--input',str(folder/'input.wav'),'--out',str(folder/'tx')], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(base + ['--role','rx','--pilot-seconds','2','--input',str(folder/'tx/tx_wire.wav'),'--out',str(folder/'rx')], check=True, stdout=subprocess.DEVNULL)
     import json
     stats = json.loads((folder/'rx/summary.json').read_text())
     assert stats['acquisitions'] == 1, stats
