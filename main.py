@@ -344,7 +344,7 @@ def main():
         del sys.argv[1]
     p = argparse.ArgumentParser(description='Independent STFT/DCT4 frame transforms + V2 64-PN synchronization over 20k TimePack')
     p.add_argument('--role', choices=['tx', 'rx', 'duplex'], required=True)
-    p.add_argument('--cipher', choices=['stft','dct4','mdct-legacy'], default='stft')
+    p.add_argument('--cipher', choices=['stft','stft-overlap','dct4','mdct-legacy'], default='stft')
     p.add_argument('--plugin', help='Optional module:Class using the two-method frame adapter')
     p.add_argument('--operation', default='signflip', help='signflip/shuffle/invert for built-ins; plug-ins own their operation')
     p.add_argument('--key-file', required=True)
@@ -370,6 +370,7 @@ def main():
     if not (0 < args.tx_gain <= 1 and 0 < args.guard_amp <= 1): p.error('invalid gain')
     if args.operation == 'invert' and not args.plugin: print('WARNING: invert is not key-dependent.', flush=True)
     if args.cipher == 'mdct-legacy' and not args.plugin: print('WARNING: MDCT legacy shuffle/signflip are NOT generally reversible after PCM synthesis; use stft/dct4 for live tests.', flush=True)
+    if args.cipher == 'stft-overlap' and not args.plugin: print('WARNING: Overlapped STFT shuffle/signflip are NOT generally reversible after PCM synthesis; compare against --cipher stft.', flush=True)
     key = Path(args.key_file).read_bytes()
     if len(key) < 16: p.error('key-file must contain at least 16 bytes')
     folder = Path(args.out); folder.mkdir(parents=True, exist_ok=True)

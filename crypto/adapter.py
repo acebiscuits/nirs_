@@ -9,6 +9,7 @@ import hashlib
 import numpy as np
 from scipy.fft import dct
 from .mdct import MDCTCipher
+from .stft_overlap import STFTOverlap
 
 FRAME = 320
 
@@ -19,6 +20,7 @@ class BuiltinFrameCipher:
     `stft` here is a 20ms rectangular STFT with hop=frame (no overlap).
     `dct4` is orthonormal type-IV DCT, not a lapped MDCT.
     `mdct-legacy` keeps the original lapped MDCT as a research baseline.
+    `stft-overlap` keeps the lapped 640/320 Hann STFT as a research baseline.
     """
     def __init__(self, key, operation='signflip', decrypt=False, kind='stft'):
         self.decrypt = decrypt
@@ -31,7 +33,9 @@ class BuiltinFrameCipher:
         if kind == 'mdct-legacy':
             self.obj = MDCTCipher(operation, key=key, key_schedule='per_frame', half_size=320)
             self.obj._process(np.zeros(FRAME), decrypt=decrypt)
-        elif kind not in ('stft','dct4'):
+        elif kind == 'stft-overlap':
+            self.obj = STFTOverlap(key=key, operation=operation, decrypt=decrypt)
+        elif kind not in ('stft', 'dct4'):
             raise ValueError('Unknown transform: '+str(kind))
 
     def _rng(self, index):
@@ -43,7 +47,9 @@ class BuiltinFrameCipher:
         samples = np.asarray(samples, dtype=np.float64)
         if index < 0 or samples.shape != (FRAME,) or not np.all(np.isfinite(samples)):
             raise ValueError('Expected nonnegative index and 320 finite PCM samples')
-        if self.kind == 'mdct-legacy':
+        if self.kind == 'stft-overlap':
+            result = self.obj.process(index, samples)
+        elif self.kind == 'mdct-legacy':
             if index != self.next_index:
                 self.obj.reset(index)
                 self.obj._process(np.zeros(FRAME), decrypt=self.decrypt)
