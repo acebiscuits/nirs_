@@ -1,0 +1,11 @@
+{"time": 1793706681.0113633, "event": "start", "role": "tx", "cipher": "stft", "operation": "shuffle", "monitor": "correct", "guard_cycle": 64, "key_frame_period": 64, "rates": [16000, 20000]}
+{"time": 1793706744.8175042, "event": "tx_progress", "frame": 0, "seconds": 0.0}
+{"time": 1793706749.813098, "event": "tx_progress", "frame": 250, "seconds": 5.0}
+{"time": 1793706754.8101199, "event": "tx_progress", "frame": 500, "seconds": 10.0}
+{"time": 1793706759.80846, "event": "tx_progress", "frame": 750, "seconds": 15.0}
+{"time": 1793706764.8185186, "event": "tx_progress", "frame": 1000, "seconds": 20.0}
+{"time": 1793706769.819324, "event": "tx_progress", "frame": 1250, "seconds": 25.0}
+{"time": 1793706774.8090415, "event": "tx_progress", "frame": 1500, "seconds": 30.0}
+{"time": 1793706779.8082893, "event": "tx_progress", "frame": 1750, "seconds": 35.0}
+{"time": 1793706784.816512, "event": "tx_progress", "frame": 2000, "seconds": 40.0}
+{"time": 1793706786.2735147, "event": "tx_done", "frames": 2074}

@@ -1,0 +1,7 @@
+{"time": 1793708155.789447, "event": "start", "role": "tx", "cipher": "stft", "operation": "shuffle", "monitor": "correct", "guard_cycle": 64, "key_frame_period": 64, "rates": [16000, 20000]}
+{"time": 1793708560.2190993, "event": "tx_progress", "frame": 0, "seconds": 0.0}
+{"time": 1793708565.2136676, "event": "tx_progress", "frame": 250, "seconds": 5.0}
+{"time": 1793708570.2167103, "event": "tx_progress", "frame": 500, "seconds": 10.0}
+{"time": 1793708575.2106814, "event": "tx_progress", "frame": 750, "seconds": 15.0}
+{"time": 1793708580.214758, "event": "tx_progress", "frame": 1000, "seconds": 20.0}
+{"time": 1793708582.6302683, "event": "tx_done", "frames": 1122}
