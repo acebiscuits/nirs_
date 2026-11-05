@@ -12,6 +12,8 @@ import time
 import wave
 from math import gcd
 from pathlib import Path
+from dataclasses import replace
+
 
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 import numpy as np
@@ -20,7 +22,7 @@ from VirtualDevices import PulseVirtualDevices, TX_SINK, RX_SOURCE, get_default_
 from crypto.adapter import make_frame_cipher
 from v2_timepack import FixedGuardSyncV1, SyncV1Config
 
-VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD = 16000, 20000, 320, 400, 80
+# VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD = 16000, 20000, 320, 400, 80
 
 
 def pcm(x):
@@ -86,6 +88,28 @@ def pilot_score(reference, received):
         if denom > 1e-8: best = max(best, float(np.dot(u, v) / denom))
     return round(best, 4)
 
+def make_sync_config():
+    base = SyncV1Config()
+    k = WIRE_RATE / 20000.0          # коэффициент от эталонной калибровки
+    return replace(
+        base,
+        rate=WIRE_RATE,
+        frameSamples=WIRE_FRAME,
+        coreSamples=VOICE_FRAME,
+        guardSamples=GUARD,
+        # ⬇ только сэмпловые поля масштабируются
+        trackRadius           = int(round(base.trackRadius           * k)),
+        trackRecoveryRadius   = int(round(base.trackRecoveryRadius   * k)),
+        trainRadius           = int(round(base.trainRadius           * k)),
+        trackContinuityRadius = int(round(base.trackContinuityRadius * k)),
+        trackChainOffsetSpread= int(round(base.trackChainOffsetSpread* k)),
+        maxTimingJump         = int(round(base.maxTimingJump         * k)),
+        maxCoreAdjust         = int(round(base.maxCoreAdjust         * k)),
+        gapRecoveryCoherence  = int(round(base.gapRecoveryCoherence  * k)),
+        gapRecoveryRadius     = int(round(base.gapRecoveryRadius     * k)),
+        acquireScanStrideSamples = int(round(base.acquireScanStrideSamples * k)),
+        # пороги 0..1, счётчики кадров, *_Frames, *_Alpha — не трогаем
+    )
 
 def guard_bank(cfg):
     # Same PN generator as receiver; exposes exactly the templates used in detection.
@@ -103,7 +127,8 @@ def log_json(fp, event, **kwargs):
 
 
 def run_tx(args, key, folder, events):
-    cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+    # cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+    cfg = make_sync_config()
     bank = guard_bank(cfg)
     encoder = make_frame_cipher(args, key, decrypt=False)
     source = None; player = None; devices = None
@@ -226,7 +251,8 @@ def run_rx(args, key, folder, events):
             stats['reacquired'] += event.get('event') == 'reacquired'
             log_json(events, 'sync_'+event.get('event','unknown'), **{k:v for k,v in event.items() if k != 'event'})
 
-        cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+        # cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+        cfg = make_sync_config()
         sync = FixedGuardSyncV1(cfg, on_frame, on_event)
         start = time.monotonic()
         rx_cpu = 0.0
@@ -359,9 +385,21 @@ def main():
     p.add_argument('--guard-amp', type=float, default=.15)
     p.add_argument('--io-samples', type=int, default=400)
     p.add_argument('--keep-loopbacks', action='store_true', help='Do not unload PulseAudio module-loopback when exiting')
+    p.add_argument('--wire-rate', type=int, default=20000, help='Wire sample rate (default: 20000). Must be a multiple of 4000 for clean 4ms guard.')
     args = p.parse_args()
     args.monitor_state = {'mode': args.monitor}
     args.shared_devices = args.role == 'duplex'
+
+
+    global VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD
+    WIRE_RATE = args.wire_rate
+    # Сохраняем пропорцию 0.8 (голос : провод) и длительности 20ms / 4ms
+    VOICE_RATE  = int(round(WIRE_RATE * 0.8))
+    WIRE_FRAME  = WIRE_RATE // 50          # 20 мс
+    VOICE_FRAME = VOICE_RATE // 50         # 20 мс
+    GUARD       = WIRE_RATE // 250         # 4 мс
+
+
     if args.role == 'duplex' and args.input: p.error('duplex uses live audio; file mode requires separate TX/RX')
     if args.role == 'duplex': args.listen = True
     if args.io_samples <= 0: p.error('io-samples must be positive')
