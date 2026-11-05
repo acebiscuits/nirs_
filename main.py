@@ -173,7 +173,16 @@ def run_tx(args, key, folder, events):
                 ['pacat','--playback','--raw',f'--device={TX_SINK}',
                 f'--rate={WIRE_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
                 stdin=subprocess.PIPE, bufsize=0)
-            # read_frame = lambda: pcm_read_exact(source.stdout, VOICE_FRAME * 2)
+            def read_frame():
+                need = int(round(MIC_RATE * 0.020)) * 2          # 1920 байт = 20 мс @ 48000
+                raw = pcm_read_exact(source.stdout, need)
+                if len(raw) != need:
+                    return b''
+                x = np.frombuffer(raw, dtype='<i2').astype(np.float32) / 32768.0
+                x = resample_poly(x, VOICE_RATE, MIC_RATE).astype(np.float32)
+                if len(x) > VOICE_FRAME:   x = x[:VOICE_FRAME]
+                elif len(x) < VOICE_FRAME: x = np.pad(x, (0, VOICE_FRAME - len(x)))
+                return pcm(x)
         with wav(folder/'tx_plain.wav', VOICE_RATE) as plain, wav(folder/'tx_wire.wav', WIRE_RATE) as wire:
             idx = 0; start = time.monotonic()
             while not stop_event.is_set() and (args.input or not args.duration or time.monotonic() - start < args.duration):
@@ -199,18 +208,6 @@ def run_tx(args, key, folder, events):
             try: player.wait(timeout=3)
             except subprocess.TimeoutExpired: player.terminate()
         if devices: devices.stop()
-
-def read_frame():
-    need = int(round(MIC_RATE * 0.020)) * 2          # 20 мс @ 48000 = 1920 байт
-    raw = pcm_read_exact(source.stdout, need)
-    if len(raw) != need:
-        return b''
-    x = np.frombuffer(raw, dtype='<i2').astype(np.float32) / 32768.0
-    # 48000 -> 38400
-    x = resample_poly(x, VOICE_RATE, MIC_RATE).astype(np.float32)
-    if   len(x) > VOICE_FRAME: x = x[:VOICE_FRAME]
-    elif len(x) < VOICE_FRAME: x = np.pad(x, (0, VOICE_FRAME - len(x)))
-    return pcm(x)
 
 def run_rx(args, key, folder, events):
     # The raw 20k stream is NEVER connected to the speaker; only extracted 16k cores are.
@@ -249,8 +246,8 @@ def run_rx(args, key, folder, events):
                     ['pacat','--playback','--raw',f'--device={headphones}',
                     f'--rate={MIC_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
                     stdin=subprocess.PIPE, bufsize=0)
-            if args.listen:
-                player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate={VOICE_RATE}','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
+            # if args.listen:
+            #     player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate={VOICE_RATE}','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
             blocks = iter(lambda: pcm_read_exact(source.stdout, args.io_samples * 2), b'')
 
         def on_frame(index, wire_frame, status, meta):
