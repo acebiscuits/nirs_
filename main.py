@@ -163,9 +163,17 @@ def run_tx(args, key, folder, events):
                 devices = PulseVirtualDevices(); devices.start()
                 print('Call microphone: TX_Microphone. Configure your call, then press Enter.', flush=True)
                 input('TX: ENTER to begin transmission > ')
-            source = subprocess.Popen(['parec','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
-            player = subprocess.Popen(['pacat','--playback','--raw',f'--device={TX_SINK}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
-            read_frame = lambda: pcm_read_exact(source.stdout, VOICE_FRAME * 2)
+            # source = subprocess.Popen(['parec','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
+            # player = subprocess.Popen(['pacat','--playback','--raw',f'--device={TX_SINK}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
+            source = subprocess.Popen(
+                ['parec','--raw',f'--device={mic}',
+                f'--rate={MIC_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdout=subprocess.PIPE, bufsize=0)
+            player = subprocess.Popen(
+                ['pacat','--playback','--raw',f'--device={TX_SINK}',
+                f'--rate={WIRE_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdin=subprocess.PIPE, bufsize=0)
+            # read_frame = lambda: pcm_read_exact(source.stdout, VOICE_FRAME * 2)
         with wav(folder/'tx_plain.wav', VOICE_RATE) as plain, wav(folder/'tx_wire.wav', WIRE_RATE) as wire:
             idx = 0; start = time.monotonic()
             while not stop_event.is_set() and (args.input or not args.duration or time.monotonic() - start < args.duration):
@@ -192,6 +200,17 @@ def run_tx(args, key, folder, events):
             except subprocess.TimeoutExpired: player.terminate()
         if devices: devices.stop()
 
+def read_frame():
+    need = int(round(MIC_RATE * 0.020)) * 2          # 20 мс @ 48000 = 1920 байт
+    raw = pcm_read_exact(source.stdout, need)
+    if len(raw) != need:
+        return b''
+    x = np.frombuffer(raw, dtype='<i2').astype(np.float32) / 32768.0
+    # 48000 -> 38400
+    x = resample_poly(x, VOICE_RATE, MIC_RATE).astype(np.float32)
+    if   len(x) > VOICE_FRAME: x = x[:VOICE_FRAME]
+    elif len(x) < VOICE_FRAME: x = np.pad(x, (0, VOICE_FRAME - len(x)))
+    return pcm(x)
 
 def run_rx(args, key, folder, events):
     # The raw 20k stream is NEVER connected to the speaker; only extracted 16k cores are.
@@ -221,9 +240,17 @@ def run_rx(args, key, folder, events):
                 print('Call speakers: RX_sink. Configure your call, then press Enter.', flush=True)
                 input('RX: ENTER to start PN synchronization > ')
             threading.Thread(target=monitor_input, args=(args,), daemon=True, name='monitor-control').start()
-            source = subprocess.Popen(['parec','--raw',f'--device={RX_SOURCE}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
+            source = subprocess.Popen(
+                ['parec','--raw',f'--device={RX_SOURCE}',
+                f'--rate={WIRE_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdout=subprocess.PIPE, bufsize=0)
             if args.listen:
-                player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
+                player = subprocess.Popen(
+                    ['pacat','--playback','--raw',f'--device={headphones}',
+                    f'--rate={MIC_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                    stdin=subprocess.PIPE, bufsize=0)
+            if args.listen:
+                player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate={VOICE_RATE}','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
             blocks = iter(lambda: pcm_read_exact(source.stdout, args.io_samples * 2), b'')
 
         def on_frame(index, wire_frame, status, meta):
@@ -239,7 +266,13 @@ def run_rx(args, key, folder, events):
             mode = selection['mode']
             active = ('cipher', 'correct', 'wrong')[(index // 250) % 3] if mode == 'rotate' else mode
             if player:
-                player.stdin.write(pcm(branches[active]) if active != 'mute' else bytes(VOICE_FRAME * 2))
+                if active != 'mute':
+                    to_play = branches[active]                        # 768 @ 38400
+                    to_play = resample_poly(to_play, MIC_RATE, VOICE_RATE).astype(np.float32)  # -> 960 @ 48000
+                    to_play = np.clip(to_play, -1, 1)
+                    player.stdin.write(pcm(to_play))
+                else:
+                    player.stdin.write(bytes(int(round(MIC_RATE * 0.020)) * 2))
             stats['frames'] += 1; stats['lost'] += (not valid)
             rms = lambda arr: round(float(np.sqrt(np.mean(arr.astype(np.float64)**2))), 6)
             writer.writerow([index, status, meta.get('corr',''), meta.get('guard_pos',''), meta.get('guard_source',''), meta.get('reason',''), active, rms(payload), rms(decoded)])
@@ -391,13 +424,15 @@ def main():
     args.shared_devices = args.role == 'duplex'
 
 
-    global VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD
+    global VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD, MIC_RATE
     WIRE_RATE = args.wire_rate
     # Сохраняем пропорцию 0.8 (голос : провод) и длительности 20ms / 4ms
     VOICE_RATE  = int(round(WIRE_RATE * 0.8))
     WIRE_FRAME  = WIRE_RATE // 50          # 20 мс
     VOICE_FRAME = VOICE_RATE // 50         # 20 мс
     GUARD       = WIRE_RATE // 250         # 4 мс
+    MIC_RATE    = 48000
+    args.voice_frame = VOICE_FRAME 
 
 
     if args.role == 'duplex' and args.input: p.error('duplex uses live audio; file mode requires separate TX/RX')

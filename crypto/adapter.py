@@ -11,7 +11,7 @@ from scipy.fft import dct
 from .mdct import MDCTCipher
 from .stft_overlap import STFTOverlap
 
-FRAME = 320
+FRAME = 768
 
 class BuiltinFrameCipher:
     """Critically sampled *independent* real-valued transforms, exactly invertible
