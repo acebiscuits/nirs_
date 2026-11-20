@@ -9,6 +9,15 @@ import numpy as np
 from scipy.linalg import eigh_tridiagonal
 from scipy.fft import dct
 FRAME = 320
+
+def configure_frame_size(size):
+    """Set the 20 ms voice payload size (fixed for the process lifetime)."""
+    global FRAME
+    size = int(size)
+    if size <= 0 or size % 64:
+        raise ValueError('Voice frame size must be positive and divisible by 64 (LWT 6 levels)')
+    FRAME = size
+
 FRFT_ORDER = .5
 LWT_LEVELS = 6
 SQRT2 = np.sqrt(2.)
@@ -157,7 +166,9 @@ def ilwt(coefficients):
     return approx
 
 
-def dtmt_basis(size=FRAME):
+def dtmt_basis(size=None):
+    if size is None:
+        size = FRAME
     """Строка T[k, :] — нормированный полином Чебышёва порядка k на 0..N-1.
 
     Та же матрица Якоби и тот же выбор знаков, что в crypto/dtmt.py проекта.
@@ -179,12 +190,12 @@ def dtmt_basis(size=FRAME):
 
 def dtmt(blocks):
     """Анализ одного блока или массива блоков, по последней оси."""
-    return np.asarray(blocks, dtype=np.float64) @ dtmt_basis().T
+    return np.asarray(blocks, dtype=np.float64) @ dtmt_basis(np.asarray(blocks).shape[-1]).T
 
 
 def idtmt(moments):
     """Синтез одного блока или массива блоков по всем 320 моментам."""
-    return np.asarray(moments, dtype=np.float64) @ dtmt_basis()
+    return np.asarray(moments, dtype=np.float64) @ dtmt_basis(np.asarray(moments).shape[-1])
 
 
 def pack_spectrum(coeff):
@@ -551,7 +562,7 @@ def forward(kind, frame):
 
 def inverse(kind, coeff):
     if kind == 'stft':
-        return np.fft.irfft(coeff, n=FRAME, norm='ortho')
+        return np.fft.irfft(coeff, n=2 * (len(coeff) - 1), norm='ortho')
     if kind in ('dct4','mdct-no-overlap'):
         return dct(coeff, type=4, norm='ortho')
     if kind == 'frft': return ifrft(coeff)

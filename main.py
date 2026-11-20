@@ -447,8 +447,10 @@ def main():
         print('WARNING: 16-bit coefficient operations require a coefficient-preserving channel; PCM16 transport destroys their reversibility.', flush=True)
     if not args.plugin and args.operation in ('amplitude-sign','amplitude-phase','amplitude-permutation'):
         print('WARNING: magnitude reordering is not robust to clipping and PCM16 quantization.', flush=True)
-    if args.wire_rate != 20000 and not args.plugin:
-        p.error('Built-in transforms currently require --wire-rate 20000 (320-sample frames)')
+    if args.wire_rate < 4000 or args.wire_rate % 4000:
+        p.error('--wire-rate must be a positive multiple of 4000 (e.g. 20000 or 48000)')
+    if not args.plugin and VOICE_FRAME % 64:
+        p.error('Built-in transforms require a voice frame divisible by 64')
     key = Path(args.key_file).read_bytes()
     if len(key) < 16: p.error('key-file must contain at least 16 bytes')
     folder = Path(args.out); folder.mkdir(parents=True, exist_ok=True)

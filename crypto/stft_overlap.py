@@ -28,11 +28,13 @@ class STFTOverlap:
     WINDOW_SIZE = 640
     OPERATIONS = ALL_OPERATIONS
 
-    def __init__(self, key: bytes, operation: str = 'signflip', decrypt: bool = False):
+    def __init__(self, key: bytes, operation: str = 'signflip', decrypt: bool = False, hop: int = 320):
         if operation not in self.OPERATIONS:
             raise ValueError('STFTOverlap operation must be invert, shuffle or signflip')
         if operation != 'invert' and not key:
             raise ValueError('Key required for shuffle/signflip')
+        self.HOP = int(hop)
+        self.WINDOW_SIZE = 2 * self.HOP
         self.key = bytes(key)
         self.operation = operation
         self.decrypt = bool(decrypt)
@@ -61,7 +63,7 @@ class STFTOverlap:
         index = int(index)
         frame = np.asarray(pcm320, dtype=np.float64)
         if index < 0 or frame.shape != (self.HOP,) or not np.all(np.isfinite(frame)):
-            raise ValueError('Expected nonnegative index and 320 finite PCM samples')
+            raise ValueError(f'Expected nonnegative index and {self.HOP} finite PCM samples')
 
         # Gap, backward jump or PN modulo-64 reacquisition: avoid mixing
         # unrelated chunks in the lapped overlap-add buffers.
