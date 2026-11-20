@@ -12,6 +12,8 @@ import time
 import wave
 from math import gcd
 from pathlib import Path
+from dataclasses import replace
+
 
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 import numpy as np
@@ -20,7 +22,7 @@ from VirtualDevices import PulseVirtualDevices, TX_SINK, RX_SOURCE, get_default_
 from crypto.adapter import make_frame_cipher
 from v2_timepack import FixedGuardSyncV1, SyncV1Config
 
-VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD = 16000, 20000, 320, 400, 80
+# VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD = 16000, 20000, 320, 400, 80
 
 
 def pcm(x):
@@ -86,6 +88,28 @@ def pilot_score(reference, received):
         if denom > 1e-8: best = max(best, float(np.dot(u, v) / denom))
     return round(best, 4)
 
+def make_sync_config():
+    base = SyncV1Config()
+    k = WIRE_RATE / 20000.0          # коэффициент от эталонной калибровки
+    return replace(
+        base,
+        rate=WIRE_RATE,
+        frameSamples=WIRE_FRAME,
+        coreSamples=VOICE_FRAME,
+        guardSamples=GUARD,
+        # ⬇ только сэмпловые поля масштабируются
+        trackRadius           = int(round(base.trackRadius           * k)),
+        trackRecoveryRadius   = int(round(base.trackRecoveryRadius   * k)),
+        trainRadius           = int(round(base.trainRadius           * k)),
+        trackContinuityRadius = int(round(base.trackContinuityRadius * k)),
+        trackChainOffsetSpread= int(round(base.trackChainOffsetSpread* k)),
+        maxTimingJump         = int(round(base.maxTimingJump         * k)),
+        maxCoreAdjust         = int(round(base.maxCoreAdjust         * k)),
+        gapRecoveryCoherence  = int(round(base.gapRecoveryCoherence  * k)),
+        gapRecoveryRadius     = int(round(base.gapRecoveryRadius     * k)),
+        acquireScanStrideSamples = int(round(base.acquireScanStrideSamples * k)),
+        # пороги 0..1, счётчики кадров, *_Frames, *_Alpha — не трогаем
+    )
 
 def guard_bank(cfg):
     # Same PN generator as receiver; exposes exactly the templates used in detection.
@@ -103,7 +127,8 @@ def log_json(fp, event, **kwargs):
 
 
 def run_tx(args, key, folder, events):
-    cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+    # cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+    cfg = make_sync_config()
     bank = guard_bank(cfg)
     encoder = make_frame_cipher(args, key, decrypt=False)
     source = None; player = None; devices = None
@@ -138,9 +163,26 @@ def run_tx(args, key, folder, events):
                 devices = PulseVirtualDevices(); devices.start()
                 print('Call microphone: TX_Microphone. Configure your call, then press Enter.', flush=True)
                 input('TX: ENTER to begin transmission > ')
-            source = subprocess.Popen(['parec','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
-            player = subprocess.Popen(['pacat','--playback','--raw',f'--device={TX_SINK}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
-            read_frame = lambda: pcm_read_exact(source.stdout, VOICE_FRAME * 2)
+            # source = subprocess.Popen(['parec','--raw',f'--device={mic}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
+            # player = subprocess.Popen(['pacat','--playback','--raw',f'--device={TX_SINK}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
+            source = subprocess.Popen(
+                ['parec','--raw',f'--device={mic}',
+                f'--rate={MIC_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdout=subprocess.PIPE, bufsize=0)
+            player = subprocess.Popen(
+                ['pacat','--playback','--raw',f'--device={TX_SINK}',
+                f'--rate={WIRE_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdin=subprocess.PIPE, bufsize=0)
+            def read_frame():
+                need = int(round(MIC_RATE * 0.020)) * 2          # 1920 байт = 20 мс @ 48000
+                raw = pcm_read_exact(source.stdout, need)
+                if len(raw) != need:
+                    return b''
+                x = np.frombuffer(raw, dtype='<i2').astype(np.float32) / 32768.0
+                x = resample_poly(x, VOICE_RATE, MIC_RATE).astype(np.float32)
+                if len(x) > VOICE_FRAME:   x = x[:VOICE_FRAME]
+                elif len(x) < VOICE_FRAME: x = np.pad(x, (0, VOICE_FRAME - len(x)))
+                return pcm(x)
         with wav(folder/'tx_plain.wav', VOICE_RATE) as plain, wav(folder/'tx_wire.wav', WIRE_RATE) as wire:
             idx = 0; start = time.monotonic()
             while not stop_event.is_set() and (args.input or not args.duration or time.monotonic() - start < args.duration):
@@ -166,7 +208,6 @@ def run_tx(args, key, folder, events):
             try: player.wait(timeout=3)
             except subprocess.TimeoutExpired: player.terminate()
         if devices: devices.stop()
-
 
 def run_rx(args, key, folder, events):
     # The raw 20k stream is NEVER connected to the speaker; only extracted 16k cores are.
@@ -196,9 +237,17 @@ def run_rx(args, key, folder, events):
                 print('Call speakers: RX_sink. Configure your call, then press Enter.', flush=True)
                 input('RX: ENTER to start PN synchronization > ')
             threading.Thread(target=monitor_input, args=(args,), daemon=True, name='monitor-control').start()
-            source = subprocess.Popen(['parec','--raw',f'--device={RX_SOURCE}','--rate=20000','--format=s16le','--channels=1','--latency-msec=30'], stdout=subprocess.PIPE, bufsize=0)
+            source = subprocess.Popen(
+                ['parec','--raw',f'--device={RX_SOURCE}',
+                f'--rate={WIRE_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                stdout=subprocess.PIPE, bufsize=0)
             if args.listen:
-                player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate=16000','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
+                player = subprocess.Popen(
+                    ['pacat','--playback','--raw',f'--device={headphones}',
+                    f'--rate={MIC_RATE}','--format=s16le','--channels=1','--latency-msec=30'],
+                    stdin=subprocess.PIPE, bufsize=0)
+            # if args.listen:
+            #     player = subprocess.Popen(['pacat','--playback','--raw',f'--device={headphones}','--rate={VOICE_RATE}','--format=s16le','--channels=1','--latency-msec=30'], stdin=subprocess.PIPE, bufsize=0)
             blocks = iter(lambda: pcm_read_exact(source.stdout, args.io_samples * 2), b'')
 
         def on_frame(index, wire_frame, status, meta):
@@ -214,7 +263,13 @@ def run_rx(args, key, folder, events):
             mode = selection['mode']
             active = ('cipher', 'correct', 'wrong')[(index // 250) % 3] if mode == 'rotate' else mode
             if player:
-                player.stdin.write(pcm(branches[active]) if active != 'mute' else bytes(VOICE_FRAME * 2))
+                if active != 'mute':
+                    to_play = branches[active]                        # 768 @ 38400
+                    to_play = resample_poly(to_play, MIC_RATE, VOICE_RATE).astype(np.float32)  # -> 960 @ 48000
+                    to_play = np.clip(to_play, -1, 1)
+                    player.stdin.write(pcm(to_play))
+                else:
+                    player.stdin.write(bytes(int(round(MIC_RATE * 0.020)) * 2))
             stats['frames'] += 1; stats['lost'] += (not valid)
             rms = lambda arr: round(float(np.sqrt(np.mean(arr.astype(np.float64)**2))), 6)
             writer.writerow([index, status, meta.get('corr',''), meta.get('guard_pos',''), meta.get('guard_source',''), meta.get('reason',''), active, rms(payload), rms(decoded)])
@@ -226,7 +281,8 @@ def run_rx(args, key, folder, events):
             stats['reacquired'] += event.get('event') == 'reacquired'
             log_json(events, 'sync_'+event.get('event','unknown'), **{k:v for k,v in event.items() if k != 'event'})
 
-        cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+        # cfg = SyncV1Config(rate=WIRE_RATE, frameSamples=WIRE_FRAME, coreSamples=VOICE_FRAME, guardSamples=GUARD)
+        cfg = make_sync_config()
         sync = FixedGuardSyncV1(cfg, on_frame, on_event)
         start = time.monotonic()
         rx_cpu = 0.0
@@ -344,9 +400,9 @@ def main():
         del sys.argv[1]
     p = argparse.ArgumentParser(description='Independent STFT/DCT4 frame transforms + V2 64-PN synchronization over 20k TimePack')
     p.add_argument('--role', choices=['tx', 'rx', 'duplex'], required=True)
-    p.add_argument('--cipher', choices=['stft','stft-overlap','dct4','mdct-legacy'], default='stft')
+    p.add_argument('--cipher', choices=['stft','stft-overlap','dct4','mdct-no-overlap','mdct-overlap','mdct-legacy','frft','fresnel','lwt','dtmt'], default='stft')
     p.add_argument('--plugin', help='Optional module:Class using the two-method frame adapter')
-    p.add_argument('--operation', default='signflip', help='signflip/shuffle/invert for built-ins; plug-ins own their operation')
+    p.add_argument('--operation', default='signflip', help='invert/shuffle/signflip/orthomix/amplitude-sign/phase-offset/amplitude-permutation/amplitude-phase/sbox/rot-xor')
     p.add_argument('--key-file', required=True)
     p.add_argument('--input', help='TX: PCM16 mono WAV at 16k/44.1k/48k/etc; RX: 20k PCM16 mono WAV')
     p.add_argument('--out', default='runs/test')
@@ -359,9 +415,23 @@ def main():
     p.add_argument('--guard-amp', type=float, default=.15)
     p.add_argument('--io-samples', type=int, default=400)
     p.add_argument('--keep-loopbacks', action='store_true', help='Do not unload PulseAudio module-loopback when exiting')
+    p.add_argument('--wire-rate', type=int, default=20000, help='Wire sample rate (default: 20000). Must be a multiple of 4000 for clean 4ms guard.')
     args = p.parse_args()
     args.monitor_state = {'mode': args.monitor}
     args.shared_devices = args.role == 'duplex'
+
+
+    global VOICE_RATE, WIRE_RATE, VOICE_FRAME, WIRE_FRAME, GUARD, MIC_RATE
+    WIRE_RATE = args.wire_rate
+    # Сохраняем пропорцию 0.8 (голос : провод) и длительности 20ms / 4ms
+    VOICE_RATE  = int(round(WIRE_RATE * 0.8))
+    WIRE_FRAME  = WIRE_RATE // 50          # 20 мс
+    VOICE_FRAME = VOICE_RATE // 50         # 20 мс
+    GUARD       = WIRE_RATE // 250         # 4 мс
+    MIC_RATE    = 48000
+    args.voice_frame = VOICE_FRAME 
+
+
     if args.role == 'duplex' and args.input: p.error('duplex uses live audio; file mode requires separate TX/RX')
     if args.role == 'duplex': args.listen = True
     if args.io_samples <= 0: p.error('io-samples must be positive')
@@ -369,8 +439,16 @@ def main():
     if args.pilot_frames < 0: p.error("pilot-seconds must be >= 0")
     if not (0 < args.tx_gain <= 1 and 0 < args.guard_amp <= 1): p.error('invalid gain')
     if args.operation == 'invert' and not args.plugin: print('WARNING: invert is not key-dependent.', flush=True)
-    if args.cipher == 'mdct-legacy' and not args.plugin: print('WARNING: MDCT legacy shuffle/signflip are NOT generally reversible after PCM synthesis; use stft/dct4 for live tests.', flush=True)
+    if args.cipher in ('mdct-legacy','mdct-overlap') and not args.plugin: print('WARNING: MDCT legacy shuffle/signflip are NOT generally reversible after PCM synthesis; use stft/dct4 for live tests.', flush=True)
     if args.cipher == 'stft-overlap' and not args.plugin: print('WARNING: Overlapped STFT shuffle/signflip are NOT generally reversible after PCM synthesis; compare against --cipher stft.', flush=True)
+    if not args.plugin and args.cipher == 'mdct-no-overlap':
+        print('NOTE: mdct-no-overlap uses orthonormal DCT-IV, NOT a true lapped MDCT.', flush=True)
+    if not args.plugin and args.operation in ('sbox','rot-xor','sbox-16','rot-xor-16','sbox-16-float-codec','rot-xor-16-float-codec'):
+        print('WARNING: 16-bit coefficient operations require a coefficient-preserving channel; PCM16 transport destroys their reversibility.', flush=True)
+    if not args.plugin and args.operation in ('amplitude-sign','amplitude-phase','amplitude-permutation'):
+        print('WARNING: magnitude reordering is not robust to clipping and PCM16 quantization.', flush=True)
+    if args.wire_rate != 20000 and not args.plugin:
+        p.error('Built-in transforms currently require --wire-rate 20000 (320-sample frames)')
     key = Path(args.key_file).read_bytes()
     if len(key) < 16: p.error('key-file must contain at least 16 bytes')
     folder = Path(args.out); folder.mkdir(parents=True, exist_ok=True)

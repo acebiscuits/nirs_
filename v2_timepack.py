@@ -115,8 +115,8 @@ class FixedGuardSyncV1:
 
     def __init__(self, cfg=None, onFrame=None, onEvent=None):
         self.cfg = cfg or SyncV1Config()
-        if self.cfg.rate != 20000:
-            raise ValueError('Timepack experimental sync expects 20000 Hz')
+        # if self.cfg.rate != 20000:
+        #     raise ValueError('Timepack experimental sync expects 20000 Hz')
         if self.cfg.coreSamples + self.cfg.guardSamples != self.cfg.frameSamples:
             raise ValueError('coreSamples + guardSamples must equal frameSamples')
         if self.cfg.spinnerSize != 8 or self.cfg.superSpinnerSize not in (1, 8):

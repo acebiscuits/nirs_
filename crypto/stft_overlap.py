@@ -18,6 +18,7 @@ lossless recovery or Opus resistance.
 import hashlib
 
 import numpy as np
+from .research_transforms import ALL_OPERATIONS, apply_operation
 
 
 class STFTOverlap:
@@ -25,7 +26,7 @@ class STFTOverlap:
 
     HOP = 320
     WINDOW_SIZE = 640
-    OPERATIONS = ('invert', 'shuffle', 'signflip')
+    OPERATIONS = ALL_OPERATIONS
 
     def __init__(self, key: bytes, operation: str = 'signflip', decrypt: bool = False):
         if operation not in self.OPERATIONS:
@@ -53,18 +54,8 @@ class STFTOverlap:
             np.frombuffer(h, dtype=np.uint32), pool_size=8))
 
     def _transform(self, spectrum, index):
-        if self.operation == 'invert':
-            # Same full-bin reversal as the original STFTCipher.
-            return spectrum[::-1].copy()
-        if self.operation == 'signflip':
-            spectrum = spectrum.copy()
-            mask = self._rng(index).choice(np.array([-1.0, 1.0]),
-                                            size=spectrum.size - 2)
-            spectrum[1:-1] *= mask
-            return spectrum
-        perm = self._rng(index).permutation(spectrum.size)
-        # As in original STFTCipher, shuffle includes DC and Nyquist.
-        return spectrum[np.argsort(perm)] if self.decrypt else spectrum[perm]
+        return apply_operation('stft', spectrum, self.operation,
+                               self.key, index, self.decrypt)
 
     def process(self, index: int, pcm320):
         index = int(index)

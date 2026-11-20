@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from .base import SpectralCipher
+from .research_transforms import ALL_OPERATIONS, apply_operation
 
 
 class MDCTCipher(SpectralCipher):
@@ -13,7 +14,7 @@ class MDCTCipher(SpectralCipher):
     как в присланном исследовательском mdct.py.
     """
 
-    SUPPORTED_OPERATIONS = {"invert", "shuffle", "signflip"}
+    SUPPORTED_OPERATIONS = set(ALL_OPERATIONS)
 
     def __init__(
         self,
@@ -117,29 +118,8 @@ class MDCTCipher(SpectralCipher):
         return y
 
     def _modify_coefficients(self, coeffs: np.ndarray, decrypt: bool) -> np.ndarray:
-        coeffs = np.asarray(coeffs).copy()
-
-        if self.operation == "invert":
-            return coeffs[::-1]
-
-        if self.operation == "signflip":
-            rng = self._rng_for_frame()
-            mask = rng.choice(
-                np.array([-1.0, 1.0]),
-                size=coeffs.shape[0],
-            ).astype(np.float64)
-            return coeffs * mask
-
-        if self.operation == "shuffle":
-            rng = self._rng_for_frame()
-            perm = rng.permutation(coeffs.shape[0])
-
-            if decrypt:
-                return coeffs[np.argsort(perm)]
-
-            return coeffs[perm]
-
-        raise RuntimeError(f"unknown MDCT operation: {self.operation}")
+        return apply_operation('dct4', np.asarray(coeffs), self.operation,
+                               self.key, self.frame_index, decrypt)
 
     def _process(self, samples: np.ndarray, decrypt: bool) -> np.ndarray:
         samples = np.asarray(samples, dtype=np.float64).reshape(-1)

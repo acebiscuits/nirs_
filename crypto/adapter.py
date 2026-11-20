@@ -1,6 +1,6 @@
 """Public plug-in contract: __init__(key, operation, decrypt); process(index, pcm320).
 
-Input and output: exactly 320 real PCM samples at 16 kHz per frame.
+Input/output: 320 samples at 16 kHz (default 20 kHz wire rate).
 A plug-in receives the absolute frame index (modulo 64 on reacquisition may be
 used by algorithms). Key generation/state management belong to the plug-in.
 """
@@ -11,73 +11,59 @@ from scipy.fft import dct
 from .mdct import MDCTCipher
 from .stft_overlap import STFTOverlap
 
-FRAME = 320
+
+from .research_transforms import (TRANSFORMS, ALL_OPERATIONS, forward, inverse,
+                                  apply_operation)
+
+FRAME = 320  # Must match the 20ms voice payload in main.py at 20k wire rate.
+
 
 class BuiltinFrameCipher:
-    """Critically sampled *independent* real-valued transforms, exactly invertible
-    before clipping/quantization. No STFT-overlap reanalysis ambiguity.
+    """Frame cipher using original standalone research algorithms.
 
-    `stft` here is a 20ms rectangular STFT with hop=frame (no overlap).
-    `dct4` is orthonormal type-IV DCT, not a lapped MDCT.
-    `mdct-legacy` keeps the original lapped MDCT as a research baseline.
-    `stft-overlap` keeps the lapped 640/320 Hann STFT as a research baseline.
+    Lapped transforms are experimental: PCM synthesis/reanalysis is not
+    generally an exact inverse for arbitrary coefficient modifications.
     """
     def __init__(self, key, operation='signflip', decrypt=False, kind='stft'):
-        self.decrypt = decrypt
-        self.kind = kind
+        if operation not in ALL_OPERATIONS:
+            raise ValueError('Unknown operation: ' + str(operation))
+        if kind not in TRANSFORMS + ('stft-overlap', 'mdct-legacy', 'mdct-overlap'):
+            raise ValueError('Unknown transform: ' + str(kind))
+        if operation != 'invert' and not key:
+            raise ValueError('Key is required for this operation')
+        self.key = bytes(key)
         self.operation = operation
-        self.key = key
-        self.next_index = 0
-        if operation not in ('signflip','shuffle','invert'):
-            raise ValueError('Unsupported built-in operation: '+str(operation))
-        if kind == 'mdct-legacy':
-            self.obj = MDCTCipher(operation, key=key, key_schedule='per_frame', half_size=320)
+        self.decrypt = bool(decrypt)
+        self.kind = kind
+        self.next_index = None
+        if kind in ('mdct-overlap', 'mdct-legacy'):
+            self.obj = MDCTCipher(operation, key=key, key_schedule='per_frame', half_size=FRAME)
+            # Pre-roll: one 320-sample hop of startup latency.
             self.obj._process(np.zeros(FRAME), decrypt=decrypt)
         elif kind == 'stft-overlap':
             self.obj = STFTOverlap(key=key, operation=operation, decrypt=decrypt)
-        elif kind not in ('stft', 'dct4'):
-            raise ValueError('Unknown transform: '+str(kind))
-
-    def _rng(self, index):
-        h = hashlib.sha512(self.key + (int(index) % 64).to_bytes(8,'big')).digest()
-        return np.random.default_rng(np.random.SeedSequence(np.frombuffer(h, dtype=np.uint32), pool_size=8))
 
     def process(self, index, samples):
         index = int(index)
         samples = np.asarray(samples, dtype=np.float64)
         if index < 0 or samples.shape != (FRAME,) or not np.all(np.isfinite(samples)):
-            raise ValueError('Expected nonnegative index and 320 finite PCM samples')
+            raise ValueError(f'Expected nonnegative index and {FRAME} finite PCM samples')
         if self.kind == 'stft-overlap':
             result = self.obj.process(index, samples)
-        elif self.kind == 'mdct-legacy':
-            if index != self.next_index:
+        elif self.kind in ('mdct-legacy', 'mdct-overlap'):
+            if self.next_index is not None and index != self.next_index:
                 self.obj.reset(index)
                 self.obj._process(np.zeros(FRAME), decrypt=self.decrypt)
-            self.next_index = index+1
             result = self.obj.decrypt(samples) if self.decrypt else self.obj.encrypt(samples)
         else:
-            if self.kind == 'stft':
-                coeff = np.fft.rfft(samples, n=FRAME)
-                # DC and Nyquist always remain real and at their original positions.
-                inner = coeff[1:-1].copy()
-            else:
-                coeff = dct(samples, type=4, norm='ortho')
-                inner = coeff.copy()
-            if self.operation == 'invert':
-                inner = inner[::-1]
-            elif self.operation == 'shuffle':
-                perm = self._rng(index).permutation(len(inner))
-                inner = inner[np.argsort(perm)] if self.decrypt else inner[perm]
-            else:
-                inner *= self._rng(index).choice(np.array([-1.,1.]),len(inner))
-            if self.kind == 'stft':
-                coeff[1:-1] = inner
-                result = np.fft.irfft(coeff, n=FRAME)
-            else:
-                result = dct(inner, type=4, norm='ortho')
-            self.next_index = index+1
+            coeff = forward(self.kind, samples)
+            changed = apply_operation(self.kind, coeff, self.operation,
+                                      self.key, index, self.decrypt)
+            result = inverse(self.kind, changed)
+        self.next_index = index + 1
+        result = np.asarray(result, dtype=np.float64)
         if result.shape != (FRAME,) or not np.all(np.isfinite(result)):
-            raise RuntimeError('Transformation did not produce 320 finite samples')
+            raise RuntimeError(f'Transform returned invalid frame shape {result.shape}')
         return np.clip(result, -1., 1.).astype(np.float32)
 
 
